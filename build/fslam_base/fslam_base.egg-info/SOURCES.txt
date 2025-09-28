@@ -1,8 +1,17 @@
 package.xml
 setup.cfg
 setup.py
+../../build/fslam_base/fslam_base.egg-info/PKG-INFO
+../../build/fslam_base/fslam_base.egg-info/SOURCES.txt
+../../build/fslam_base/fslam_base.egg-info/dependency_links.txt
+../../build/fslam_base/fslam_base.egg-info/entry_points.txt
+../../build/fslam_base/fslam_base.egg-info/requires.txt
+../../build/fslam_base/fslam_base.egg-info/top_level.txt
+../../build/fslam_base/fslam_base.egg-info/zip-safe
 fslam_base/__init__.py
 fslam_base/cone_snapshot_node.py
+fslam_base/fslam_localizer.py
+fslam_base/fslam_viz.py
 fslam_base.egg-info/PKG-INFO
 fslam_base.egg-info/SOURCES.txt
 fslam_base.egg-info/dependency_links.txt

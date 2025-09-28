@@ -1,0 +1,17 @@
+running develop
+running egg_info
+writing fslam_base.egg-info/PKG-INFO
+writing dependency_links to fslam_base.egg-info/dependency_links.txt
+writing entry points to fslam_base.egg-info/entry_points.txt
+writing requirements to fslam_base.egg-info/requires.txt
+writing top-level names to fslam_base.egg-info/top_level.txt
+reading manifest file 'fslam_base.egg-info/SOURCES.txt'
+writing manifest file 'fslam_base.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_base/lib/python3.8/site-packages/fslam-base.egg-link (link to .)
+Installing debug script to /home/armaanm/eufs_dev/FastSLAM/install/fslam_base/lib/fslam_base
+Installing fslam script to /home/armaanm/eufs_dev/FastSLAM/install/fslam_base/lib/fslam_base
+Installing map_snap script to /home/armaanm/eufs_dev/FastSLAM/install/fslam_base/lib/fslam_base
+
+Installed /home/armaanm/eufs_dev/FastSLAM/build/fslam_base
+running symlink_data
