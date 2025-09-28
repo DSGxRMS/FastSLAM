@@ -1,0 +1,1 @@
+map_snap - takes snap shot from initial pose fir map alignment

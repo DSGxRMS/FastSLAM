@@ -1,0 +1,3 @@
+[console_scripts]
+map_snap = fslam_base.cone_snapshot_node:main
+
