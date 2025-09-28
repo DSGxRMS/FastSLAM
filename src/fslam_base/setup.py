@@ -22,7 +22,8 @@ setup(
         'console_scripts': [
             'map_snap = fslam_base.cone_snapshot_node:main',
             'fslam = fslam_base.fslam_localizer:main',
-            'debug = fslam_base.fslam_viz:main'
+            'debug = fslam_base.fslam_viz:main',
+            'calib = fslam_base.wheel_calib:main',
         ],
     },
 )

@@ -11,7 +11,9 @@ setup.py
 fslam_base/__init__.py
 fslam_base/cone_snapshot_node.py
 fslam_base/fslam_localizer.py
+fslam_base/fslam_localizer_mahal.py
 fslam_base/fslam_viz.py
+fslam_base/wheel_calib.py
 fslam_base.egg-info/PKG-INFO
 fslam_base.egg-info/SOURCES.txt
 fslam_base.egg-info/dependency_links.txt
