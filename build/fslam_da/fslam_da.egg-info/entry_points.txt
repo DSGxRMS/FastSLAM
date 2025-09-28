@@ -1,0 +1,3 @@
+[console_scripts]
+da_node = fslam_da.da_node:main
+

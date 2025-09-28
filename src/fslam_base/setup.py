@@ -20,10 +20,10 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'map_snap = fslam_base.cone_snapshot_node:main',
+            'map_snap = fslam_base.support_nodes.cone_snapshot_node:main',
             'fslam = fslam_base.fslam_localizer:main',
             'debug = fslam_base.fslam_viz:main',
-            'calib = fslam_base.wheel_calib:main',
+            'calib = fslam_base.support_nodes.wheel_calib:main',
         ],
     },
 )

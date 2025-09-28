@@ -1,0 +1,25 @@
+[0.774s] Invoking command in '/home/armaanm/eufs_dev/FastSLAM/build/fslam_da': PYTHONPATH=/home/armaanm/eufs_dev/FastSLAM/build/fslam_da/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/armaanm/eufs_dev/FastSLAM/install/fslam_da/lib/python3.8/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/armaanm/eufs_dev/FastSLAM/build/fslam_da/build --no-deps symlink_data
+[0.999s] running develop
+[1.109s] running egg_info
+[1.109s] creating fslam_da.egg-info
+[1.110s] writing fslam_da.egg-info/PKG-INFO
+[1.110s] writing dependency_links to fslam_da.egg-info/dependency_links.txt
+[1.110s] writing entry points to fslam_da.egg-info/entry_points.txt
+[1.110s] writing requirements to fslam_da.egg-info/requires.txt
+[1.110s] writing top-level names to fslam_da.egg-info/top_level.txt
+[1.111s] writing manifest file 'fslam_da.egg-info/SOURCES.txt'
+[1.140s] reading manifest file 'fslam_da.egg-info/SOURCES.txt'
+[1.141s] writing manifest file 'fslam_da.egg-info/SOURCES.txt'
+[1.171s] running build_ext
+[1.171s] Creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_da/lib/python3.8/site-packages/site.py
+[1.174s] Creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_da/lib/python3.8/site-packages/fslam-da.egg-link (link to .)
+[1.174s] Installing da_node script to /home/armaanm/eufs_dev/FastSLAM/install/fslam_da/lib/fslam_da
+[1.174s] 
+[1.174s] Installed /home/armaanm/eufs_dev/FastSLAM/build/fslam_da
+[1.175s] running symlink_data
+[1.175s] creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_da/share/ament_index
+[1.175s] creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_da/share/ament_index/resource_index
+[1.175s] creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_da/share/ament_index/resource_index/packages
+[1.175s] symbolically linking /home/armaanm/eufs_dev/FastSLAM/build/fslam_da/resource/fslam_da -> /home/armaanm/eufs_dev/FastSLAM/install/fslam_da/share/ament_index/resource_index/packages
+[1.175s] symbolically linking /home/armaanm/eufs_dev/FastSLAM/build/fslam_da/package.xml -> /home/armaanm/eufs_dev/FastSLAM/install/fslam_da/share/fslam_da
+[1.214s] Invoked command in '/home/armaanm/eufs_dev/FastSLAM/build/fslam_da' returned '0': PYTHONPATH=/home/armaanm/eufs_dev/FastSLAM/build/fslam_da/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/armaanm/eufs_dev/FastSLAM/install/fslam_da/lib/python3.8/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/armaanm/eufs_dev/FastSLAM/build/fslam_da/build --no-deps symlink_data

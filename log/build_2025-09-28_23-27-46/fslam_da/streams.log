@@ -1,0 +1,17 @@
+[1.637s] Invoking command in '/home/armaanm/eufs_dev/FastSLAM/build/fslam_da': PYTHONPATH=/home/armaanm/eufs_dev/FastSLAM/build/fslam_da/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/armaanm/eufs_dev/FastSLAM/install/fslam_da/lib/python3.8/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/armaanm/eufs_dev/FastSLAM/build/fslam_da/build --no-deps symlink_data
+[1.956s] running develop
+[2.130s] running egg_info
+[2.130s] writing fslam_da.egg-info/PKG-INFO
+[2.131s] writing dependency_links to fslam_da.egg-info/dependency_links.txt
+[2.132s] writing entry points to fslam_da.egg-info/entry_points.txt
+[2.132s] writing requirements to fslam_da.egg-info/requires.txt
+[2.132s] writing top-level names to fslam_da.egg-info/top_level.txt
+[2.171s] reading manifest file 'fslam_da.egg-info/SOURCES.txt'
+[2.172s] writing manifest file 'fslam_da.egg-info/SOURCES.txt'
+[2.216s] running build_ext
+[2.216s] Creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_da/lib/python3.8/site-packages/fslam-da.egg-link (link to .)
+[2.218s] Installing da_node script to /home/armaanm/eufs_dev/FastSLAM/install/fslam_da/lib/fslam_da
+[2.219s] 
+[2.219s] Installed /home/armaanm/eufs_dev/FastSLAM/build/fslam_da
+[2.219s] running symlink_data
+[2.325s] Invoked command in '/home/armaanm/eufs_dev/FastSLAM/build/fslam_da' returned '0': PYTHONPATH=/home/armaanm/eufs_dev/FastSLAM/build/fslam_da/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/armaanm/eufs_dev/FastSLAM/install/fslam_da/lib/python3.8/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/armaanm/eufs_dev/FastSLAM/build/fslam_da/build --no-deps symlink_data

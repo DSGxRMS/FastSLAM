@@ -1,0 +1,9 @@
+source;share/fslam_da/hook/pythonpath.ps1
+source;share/fslam_da/hook/pythonpath.dsv
+source;share/fslam_da/hook/pythonpath.sh
+source;share/fslam_da/hook/ament_prefix_path.ps1
+source;share/fslam_da/hook/ament_prefix_path.dsv
+source;share/fslam_da/hook/ament_prefix_path.sh
+source;../../build/fslam_da/share/fslam_da/hook/pythonpath_develop.ps1
+source;../../build/fslam_da/share/fslam_da/hook/pythonpath_develop.dsv
+source;../../build/fslam_da/share/fslam_da/hook/pythonpath_develop.sh

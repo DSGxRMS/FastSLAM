@@ -1,0 +1,2 @@
+frame,t,match_frac,mean_mahal_sqrt,p95_mahal_sqrt,wrong_side_rate,color_confusions,n_obs
+0,1013.644000,1.000,0.005,0.005,0.333,0,18
