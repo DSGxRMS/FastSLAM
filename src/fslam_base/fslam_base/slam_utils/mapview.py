@@ -3,11 +3,15 @@
 # Usage: python3 plot_cones.py [path/to/cone_snapshot.csv]
 # Defaults to data/cone_snapshot.csv
 
-import sys, csv
+import sys, csv, os
 import matplotlib.pyplot as plt
 from collections import defaultdict
+from pathlib import Path
 
-path = sys.argv[1] if len(sys.argv) > 1 else "data/cone_snapshot.csv"
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(DATA_DIR, "cone_snapshot.csv")
 
 # Read CSV, skipping commented meta lines
 rows = []

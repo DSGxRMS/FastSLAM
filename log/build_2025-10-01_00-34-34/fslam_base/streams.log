@@ -1,0 +1,21 @@
+[0.712s] Invoking command in '/home/armaanm/eufs_dev/FastSLAM/build/fslam_base': PYTHONPATH=/home/armaanm/eufs_dev/FastSLAM/build/fslam_base/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/armaanm/eufs_dev/FastSLAM/install/fslam_base/lib/python3.8/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/armaanm/eufs_dev/FastSLAM/build/fslam_base/build --no-deps symlink_data
+[0.890s] running develop
+[0.987s] running egg_info
+[0.988s] writing fslam_base.egg-info/PKG-INFO
+[0.988s] writing dependency_links to fslam_base.egg-info/dependency_links.txt
+[0.988s] writing entry points to fslam_base.egg-info/entry_points.txt
+[0.988s] writing requirements to fslam_base.egg-info/requires.txt
+[0.988s] writing top-level names to fslam_base.egg-info/top_level.txt
+[1.012s] reading manifest file 'fslam_base.egg-info/SOURCES.txt'
+[1.012s] writing manifest file 'fslam_base.egg-info/SOURCES.txt'
+[1.039s] running build_ext
+[1.041s] Creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_base/lib/python3.8/site-packages/fslam-base.egg-link (link to .)
+[1.041s] Installing calib script to /home/armaanm/eufs_dev/FastSLAM/install/fslam_base/lib/fslam_base
+[1.042s] Installing debug script to /home/armaanm/eufs_dev/FastSLAM/install/fslam_base/lib/fslam_base
+[1.042s] Installing fslam script to /home/armaanm/eufs_dev/FastSLAM/install/fslam_base/lib/fslam_base
+[1.042s] Installing map_snap script to /home/armaanm/eufs_dev/FastSLAM/install/fslam_base/lib/fslam_base
+[1.042s] Installing wheel_debug script to /home/armaanm/eufs_dev/FastSLAM/install/fslam_base/lib/fslam_base
+[1.042s] 
+[1.042s] Installed /home/armaanm/eufs_dev/FastSLAM/build/fslam_base
+[1.042s] running symlink_data
+[1.081s] Invoked command in '/home/armaanm/eufs_dev/FastSLAM/build/fslam_base' returned '0': PYTHONPATH=/home/armaanm/eufs_dev/FastSLAM/build/fslam_base/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/armaanm/eufs_dev/FastSLAM/install/fslam_base/lib/python3.8/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/armaanm/eufs_dev/FastSLAM/build/fslam_base/build --no-deps symlink_data

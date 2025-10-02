@@ -20,7 +20,11 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'da_node = fslam_da.da_node:main',
+            'ijcbb = fslam_da.ijcbb:main',
+            'jcbb = fslam_da.jcbb:main',
+            'hungarian = fslam_da.hungarian:main',
+            'icp = fslam_da.icp:main',
+            'filter = fslam_da.filter:main',
         ],
     },
 )
