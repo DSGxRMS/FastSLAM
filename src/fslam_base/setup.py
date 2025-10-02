@@ -25,6 +25,7 @@ setup(
             'debug = fslam_base.fslam_viz:main',
             'calib = fslam_base.support_nodes.wheel_calib:main',
             'wheel_debug = fslam_base.support_nodes.wheel_check:main',
+            'predict = fslam_base.predict:main'
         ],
     },
 )
