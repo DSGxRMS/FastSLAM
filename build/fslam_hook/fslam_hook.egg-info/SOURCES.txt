@@ -1,0 +1,14 @@
+package.xml
+setup.cfg
+setup.py
+fslam_hook/__init__.py
+fslam_hook/jcbb_slam.py
+fslam_hook/wcorrect.py
+fslam_hook.egg-info/PKG-INFO
+fslam_hook.egg-info/SOURCES.txt
+fslam_hook.egg-info/dependency_links.txt
+fslam_hook.egg-info/entry_points.txt
+fslam_hook.egg-info/requires.txt
+fslam_hook.egg-info/top_level.txt
+fslam_hook.egg-info/zip-safe
+resource/fslam_hook

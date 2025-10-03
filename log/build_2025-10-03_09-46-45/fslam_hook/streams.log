@@ -1,0 +1,18 @@
+[0.696s] Invoking command in '/home/armaanm/eufs_dev/FastSLAM/build/fslam_hook': PYTHONPATH=/home/armaanm/eufs_dev/FastSLAM/build/fslam_hook/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/lib/python3.8/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/armaanm/eufs_dev/FastSLAM/build/fslam_hook/build --no-deps symlink_data
+[0.856s] running develop
+[0.936s] running egg_info
+[0.936s] writing fslam_hook.egg-info/PKG-INFO
+[0.936s] writing dependency_links to fslam_hook.egg-info/dependency_links.txt
+[0.937s] writing entry points to fslam_hook.egg-info/entry_points.txt
+[0.937s] writing requirements to fslam_hook.egg-info/requires.txt
+[0.937s] writing top-level names to fslam_hook.egg-info/top_level.txt
+[0.959s] reading manifest file 'fslam_hook.egg-info/SOURCES.txt'
+[0.960s] writing manifest file 'fslam_hook.egg-info/SOURCES.txt'
+[0.985s] running build_ext
+[0.985s] Creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/lib/python3.8/site-packages/fslam-hook.egg-link (link to .)
+[0.986s] Installing jcbb_slam script to /home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/lib/fslam_hook
+[0.986s] Installing wcorrect script to /home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/lib/fslam_hook
+[0.986s] 
+[0.986s] Installed /home/armaanm/eufs_dev/FastSLAM/build/fslam_hook
+[0.986s] running symlink_data
+[1.008s] Invoked command in '/home/armaanm/eufs_dev/FastSLAM/build/fslam_hook' returned '0': PYTHONPATH=/home/armaanm/eufs_dev/FastSLAM/build/fslam_hook/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/lib/python3.8/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/armaanm/eufs_dev/FastSLAM/build/fslam_hook/build --no-deps symlink_data

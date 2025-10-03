@@ -1,0 +1,17 @@
+[0.639s] Invoking command in '/home/armaanm/eufs_dev/FastSLAM/build/fslam_hook': PYTHONPATH=/home/armaanm/eufs_dev/FastSLAM/build/fslam_hook/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/lib/python3.8/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/armaanm/eufs_dev/FastSLAM/build/fslam_hook/build --no-deps symlink_data
+[0.777s] running develop
+[0.857s] running egg_info
+[0.857s] writing fslam_hook.egg-info/PKG-INFO
+[0.857s] writing dependency_links to fslam_hook.egg-info/dependency_links.txt
+[0.858s] writing entry points to fslam_hook.egg-info/entry_points.txt
+[0.858s] writing requirements to fslam_hook.egg-info/requires.txt
+[0.858s] writing top-level names to fslam_hook.egg-info/top_level.txt
+[0.873s] reading manifest file 'fslam_hook.egg-info/SOURCES.txt'
+[0.874s] writing manifest file 'fslam_hook.egg-info/SOURCES.txt'
+[0.892s] running build_ext
+[0.892s] Creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/lib/python3.8/site-packages/fslam-hook.egg-link (link to .)
+[0.892s] Installing jcbb_slam script to /home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/lib/fslam_hook
+[0.893s] 
+[0.893s] Installed /home/armaanm/eufs_dev/FastSLAM/build/fslam_hook
+[0.893s] running symlink_data
+[0.913s] Invoked command in '/home/armaanm/eufs_dev/FastSLAM/build/fslam_hook' returned '0': PYTHONPATH=/home/armaanm/eufs_dev/FastSLAM/build/fslam_hook/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/lib/python3.8/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/armaanm/eufs_dev/FastSLAM/build/fslam_hook/build --no-deps symlink_data

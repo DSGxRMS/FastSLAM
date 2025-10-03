@@ -1,0 +1,22 @@
+running develop
+running egg_info
+creating fslam_hook.egg-info
+writing fslam_hook.egg-info/PKG-INFO
+writing dependency_links to fslam_hook.egg-info/dependency_links.txt
+writing entry points to fslam_hook.egg-info/entry_points.txt
+writing requirements to fslam_hook.egg-info/requires.txt
+writing top-level names to fslam_hook.egg-info/top_level.txt
+writing manifest file 'fslam_hook.egg-info/SOURCES.txt'
+reading manifest file 'fslam_hook.egg-info/SOURCES.txt'
+writing manifest file 'fslam_hook.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/lib/python3.8/site-packages/site.py
+Creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/lib/python3.8/site-packages/fslam-hook.egg-link (link to .)
+
+Installed /home/armaanm/eufs_dev/FastSLAM/build/fslam_hook
+running symlink_data
+creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/share/ament_index
+creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/share/ament_index/resource_index
+creating /home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/share/ament_index/resource_index/packages
+symbolically linking /home/armaanm/eufs_dev/FastSLAM/build/fslam_hook/resource/fslam_hook -> /home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/share/ament_index/resource_index/packages
+symbolically linking /home/armaanm/eufs_dev/FastSLAM/build/fslam_hook/package.xml -> /home/armaanm/eufs_dev/FastSLAM/install/fslam_hook/share/fslam_hook
