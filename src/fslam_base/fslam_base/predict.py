@@ -49,9 +49,9 @@ class ImuPosePredictorTester(Node):
         # Params
         self.declare_parameter("imu_topic", "/imu/data")
         self.declare_parameter("gt_topic", "/ground_truth/odom")
-        self.declare_parameter("duration_s", 30.0)
+        self.declare_parameter("duration_s", 35.0)
         self.declare_parameter("log_period_s", 0.5)
-        self.declare_parameter("bias_window_s", 2.0)
+        self.declare_parameter("bias_window_s", 5.0)
         self.declare_parameter("max_dt_imu", 0.05)
         self.declare_parameter("vel_leak_hz", 0.0)   # small bleed to tame drift (0 disables)
 
