@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
             'jcbb_slam = fslam_hook.jcbb_slam:main',
             'wcorrect = fslam_hook.wcorrect:main',
+            'ijcbb_slam = fslam_hook.ijcbb_slam:main',
         ],
     },
 )

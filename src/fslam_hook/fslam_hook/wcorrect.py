@@ -55,7 +55,7 @@ class ImuWheelEKF(Node):
         self.declare_parameter("topics.out_pose2d", "/odometry_integration/pose2d")
 
         self.declare_parameter("run.bias_window_s", 5.0)
-        self.declare_parameter("run.active_seconds", 30.0)
+        self.declare_parameter("run.active_seconds", 40.0)
         self.declare_parameter("log.cli_hz", 1.0)
 
         self.declare_parameter("input.imu_use_rate_hz", 0.0)

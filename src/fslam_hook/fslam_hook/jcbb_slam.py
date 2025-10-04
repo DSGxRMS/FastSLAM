@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import math, json, time, bisect
 from collections import deque
 from pathlib import Path
@@ -62,20 +63,20 @@ class JCBBNode(Node):
 
         # params
         self.declare_parameter("detections_frame", "base")
-        self.declare_parameter("map_crop_m", 25.0)
-        self.declare_parameter("chi2_gate_2d", 13.28)
-        self.declare_parameter("joint_sig", 0.99)
+        self.declare_parameter("map_crop_m", 28.0)
+        self.declare_parameter("chi2_gate_2d", 11.83)
+        self.declare_parameter("joint_sig", 0.95)
         self.declare_parameter("meas_sigma_floor_xy", 0.30)
         self.declare_parameter("alpha_trans", 0.9)
         self.declare_parameter("beta_rot", 0.9)
         self.declare_parameter("odom_buffer_sec", 2.0)
-        self.declare_parameter("extrapolation_cap_ms", 120.0)
+        self.declare_parameter("extrapolation_cap_ms", 60.0)
         self.declare_parameter("target_cone_hz", 25.0)
         self.declare_parameter("min_candidates", 0)
         self.declare_parameter("map_data_dir", "slam_utils/data")
         self.declare_parameter("max_pairs_print", 6)
 
-        # topics (pose now from WS-EKF odom)
+        # topics
         self.declare_parameter("pose_topic", "/odometry_integration/car_state")
         self.declare_parameter("cones_topic", "/ground_truth/cones")
 
@@ -113,6 +114,10 @@ class JCBBNode(Node):
         self.odom_buf: deque = deque()  # (t,x,y,yaw,v,yawrate)
         self.pose_latest = np.array([0.0,0.0,0.0], float)
         self._pose_feed_ready = False
+
+        # logging throttle
+        self._log_period = 0.5  # seconds
+        self._last_log_wall = 0.0
 
         q = QoSProfile(depth=100, reliability=QoSReliabilityPolicy.RELIABLE,
                        durability=QoSDurabilityPolicy.VOLATILE,
@@ -190,7 +195,7 @@ class JCBBNode(Node):
         t0 = time.perf_counter()
         t_z = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
         pose_w_b, dt_pose, v, yawrate = self._pose_at(t_z)
-        dt_pose_eff = dt_pose if math.isfinite(dt_pose) else 0.0  # inf-safe for math
+        dt_pose_eff = dt_pose if math.isfinite(dt_pose) else 0.0
 
         x,y,yaw = pose_w_b
         Rwb = rot2d(yaw); Rbw = Rwb.T
@@ -245,7 +250,7 @@ class JCBBNode(Node):
             total_cands += len(cc)
 
         if total_cands==0:
-            self._print_line(t_z, dt_pose, v, n_obs, 0, total_cands, 0, [])
+            self._print_line(t_z, n_obs, 0, int((time.perf_counter()-t0)*1000))
             self.frame_idx += 1
             return
 
@@ -285,13 +290,8 @@ class JCBBNode(Node):
 
         dfs(0, [], 0.0)
 
-        pairs_sorted = sorted(best_pairs, key=lambda t: t[0])
-        show = []
-        for oi, mid, m2 in pairs_sorted[:self.max_pairs_print]:
-            show.append(f"(obs{oi}->map{mid}, √m²={math.sqrt(max(0.0,m2)):.2f})")
-
         proc_ms = int((time.perf_counter()-t0)*1000)
-        self._print_line(t_z, dt_pose, v, n_obs, len(best_pairs), total_cands, proc_ms, show)
+        self._print_line(t_z, n_obs, best_K, proc_ms)
         self.frame_idx += 1
 
     # ---- helpers ----
@@ -304,21 +304,18 @@ class JCBBNode(Node):
         S[0,0]+=1e-9; S[1,1]+=1e-9
         return S
 
-    def _print_line(self, t_z, dt_pose, v, n_obs, n_match, n_cands_total, proc_ms, show_pairs):
+    # ---- minimal, throttled logger (every 0.5s) ----
+    def _print_line(self, t_z: float, n_obs: int, n_match: int, proc_ms: int):
+        now = time.time()
+        if (now - self._last_log_wall) < self._log_period:
+            return
+        self._last_log_wall = now
+
         pass_dt = 0.0 if self._last_t is None else (t_z - self._last_t)
         self._last_t = t_z
-        mean_cands = n_cands_total / max(1, n_obs)
-
-        # inf-safe formatting
-        dt_pose_ms_str = f"{int(dt_pose*1000)}ms" if math.isfinite(dt_pose) else "inf"
         pass_dt_ms_str = f"{int(pass_dt*1000)}ms" if math.isfinite(pass_dt) else "inf"
 
-        base = (f"[jcbb] pass_dt={pass_dt_ms_str}  Δt_pose={dt_pose_ms_str}  "
-                f"v={v:.2f}m/s  obs={n_obs}  mean_cands/obs={mean_cands:.2f}  "
-                f"matched={n_match}  proc={proc_ms}ms")
-        if show_pairs:
-            base += " | " + ", ".join(show_pairs)
-        print(base)
+        print(f"[jcbb] obs={n_obs} matched={n_match} pass_dt={pass_dt_ms_str} proc={proc_ms}ms")
 
 def main():
     rclpy.init()
