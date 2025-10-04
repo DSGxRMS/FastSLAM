@@ -23,6 +23,8 @@ setup(
             'jcbb_slam = fslam_hook.jcbb_slam:main',
             'wcorrect = fslam_hook.wcorrect:main',
             'ijcbb_slam = fslam_hook.ijcbb_slam:main',
+            'icp_slam = fslam_hook.icp_slam:main',
+            'hungarian_slam = fslam_hook.hungarian_slam:main',
         ],
     },
 )
