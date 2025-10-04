@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-# ijcbb_min.py — Minimal iJCBB DA runner (GT odom + GT cones)
-# - SensorData QoS to avoid backlog (BEST_EFFORT, KEEP_LAST, depth=1)
-# - Throttled console logs (every 0.5 s): obs, matched, pass_dt, proc
-# - Vectorized gating + per-obs Cholesky reuse
-# - Same dynamic covariance inflation as your filter (alpha/beta on v, yawrate, dt_pose, range)
+# ijcbb_min_fast.py — iJCBB-lite (GT odom + GT cones), optimized
+# Speed-ups:
+#  - Uniform-grid spatial hash for map crop (O(1)-ish candidate lookup)
+#  - Cholesky "solve" (no explicit Σ^-1)
+#  - Cap candidates per obs after gating (top-K)
+#  - Strong pruning in DFS
+# Accuracy:
+#  - Same gating + inflation + assignment policy as your iJCBB-lite
 
 import math, json, time, bisect
 from pathlib import Path
-from collections import deque
+from collections import deque, defaultdict
 from typing import List, Tuple
 
 import numpy as np
@@ -20,9 +23,9 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy, QoS
 from nav_msgs.msg import Odometry
 from eufs_msgs.msg import ConeArrayWithCovariance
 
-# ---------- Map assets ----------
 BASE_DIR = Path(__file__).resolve().parents[0]
 
+# ---------- io/helpers ----------
 def load_known_map(csv_path: Path):
     import csv as _csv
     rows=[]
@@ -43,7 +46,6 @@ def load_known_map(csv_path: Path):
         rows.append((x,y,c))
     return rows
 
-# ---------- Math helpers ----------
 def rot2d(theta: float) -> np.ndarray:
     c,s = math.cos(theta), math.sin(theta)
     return np.array([[c,-s],[s,c]], float)
@@ -56,27 +58,17 @@ def yaw_from_quat(x: float, y: float, z: float, w: float) -> float:
     cosy_cosp = 1.0 - 2.0*(y*y + z*z)
     return math.atan2(siny_cosp, cosy_cosp)
 
-def chi2_thresh_2d(sig=0.99):
-    # 2 dof
-    if abs(sig-0.99) < 1e-6: return 9.2103
-    if abs(sig-0.997) < 1e-6: return 11.829
-    if abs(sig-0.95) < 1e-6: return 5.9915
-    # Wilson–Hilferty approx fallback
-    dof=2
-    z = {0.95:1.64485, 0.99:2.32635, 0.997:2.96774}.get(sig, 2.32635)
-    return dof * (1 - 2/(9*dof) + z*math.sqrt(2/(9*dof)))**3
-
-# ---------- Minimal iJCBB ----------
+# ---------- iJCBB-lite assignment (unchanged policy) ----------
 def ijcbb_assign(cand_per_obs: List[np.ndarray], mahal_costs: List[np.ndarray]) -> Tuple[List[int], int]:
     """
-    cand_per_obs[i] -> array of map_ids for obs i (shape [Ki])
-    mahal_costs[i]  -> array of Mahalanobis^2 for those candidates (shape [Ki])
-    Greedy-ordered backtracking preferring more matches and lower sum of m2.
-    (No joint chi-square set test.)
+    Greedy-ordered backtracking preferring more matches then lower total m2.
+    Enforces unique map assignments. No joint chi-square set test.
     """
     n = len(cand_per_obs)
+    # order by best individual cost (empties last)
     best_first = np.array([c[0] if c.size>0 else np.inf for c in mahal_costs])
     order = np.argsort(best_first)
+
     best_assign = [-1]*n
     best_matched = 0
     best_score = float('inf')
@@ -85,23 +77,30 @@ def ijcbb_assign(cand_per_obs: List[np.ndarray], mahal_costs: List[np.ndarray]) 
 
     def dfs(k:int, matched:int, score:float):
         nonlocal best_matched, best_score, best_assign
+        # bound: even if we match everything left, can we beat current best?
+        if matched + (n - k) < best_matched:
+            return
         if k == n:
-            if matched > best_matched or (matched==best_matched and score < best_score):
+            if matched > best_matched or (matched == best_matched and score < best_score):
                 best_matched = matched
                 best_score = score
                 best_assign = assign.copy()
             return
+
         oi = order[k]
         mids = cand_per_obs[oi]
         costs = mahal_costs[oi]
+
         # try candidates in ascending cost
         for j in range(mids.size):
             mid = int(mids[j])
-            if mid in used: continue
+            if mid in used: 
+                continue
             c = float(costs[j])
             used.add(mid); assign[oi]=mid
             dfs(k+1, matched+1, score+c)
             assign[oi]=-1; used.remove(mid)
+
         # allow unmatched
         dfs(k+1, matched, score)
 
@@ -113,7 +112,7 @@ class IJCBBCore(Node):
     def __init__(self):
         super().__init__("fslam_ijcbb")
 
-        # Params (minimal)
+        # Params
         self.declare_parameter("detections_frame", "base")   # "base" or "world"
         self.declare_parameter("map_crop_m", 25.0)
         self.declare_parameter("chi2_gate_2d", 11.83)        # gating on 2 dof
@@ -124,7 +123,11 @@ class IJCBBCore(Node):
         self.declare_parameter("extrapolation_cap_ms", 120.0)
         self.declare_parameter("target_cone_hz", 25.0)
         self.declare_parameter("map_data_dir", "slam_utils/data")
-        self.declare_parameter("log_period_s", 0.5)          # print every 0.5s
+        self.declare_parameter("log_period_s", 0.5)
+
+        # Speed-tuning knobs (safe defaults)
+        self.declare_parameter("top_k_per_obs", 24)          # cap on candidates after gating
+        self.declare_parameter("grid_cell_m", 6.0)           # spatial-hash cell size (≈ cone spacing)
 
         p = self.get_parameter
         self.detections_frame = str(p("detections_frame").value).lower()
@@ -137,6 +140,9 @@ class IJCBBCore(Node):
         self.extrap_cap = float(p("extrapolation_cap_ms").value) / 1000.0
         self.target_cone_hz = float(p("target_cone_hz").value)
         self.log_period = float(p("log_period_s").value)
+
+        self.top_k_per_obs = int(p("top_k_per_obs").value)
+        self.grid_cell_m   = float(p("grid_cell_m").value)
 
         # Map & alignment
         data_dir = (BASE_DIR / str(p("map_data_dir").value)).resolve()
@@ -153,6 +159,9 @@ class IJCBBCore(Node):
         self.map_xy = (M @ R_map.T) + t_map
         self.n_map = self.map_xy.shape[0]
 
+        # Build spatial hash (uniform grid)
+        self._build_grid_index()
+
         # State
         self.odom_buf: deque = deque()  # (t, x, y, yaw, v, yawrate)
         self.pose_latest = np.array([0.0,0.0,0.0], float)
@@ -161,26 +170,50 @@ class IJCBBCore(Node):
         self._last_t = None
         self._last_log_wall = 0.0
 
-        # QoS — SensorData style to prevent backlog (GT topics)
-        q_cones = QoSProfile(
-            depth=1,
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            durability=QoSDurabilityPolicy.VOLATILE,
-            history=QoSHistoryPolicy.KEEP_LAST
-        )
-        q_odom = QoSProfile(
-            depth=20,
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            durability=QoSDurabilityPolicy.VOLATILE,
-            history=QoSHistoryPolicy.KEEP_LAST
-        )
+        # QoS — SensorData style (GT topics)
+        q_cones = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                             durability=QoSDurabilityPolicy.VOLATILE, history=QoSHistoryPolicy.KEEP_LAST)
+        q_odom = QoSProfile(depth=20, reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                            durability=QoSDurabilityPolicy.VOLATILE, history=QoSHistoryPolicy.KEEP_LAST)
 
         self.create_subscription(Odometry, "/ground_truth/odom", self.cb_odom, q_odom)
         self.create_subscription(ConeArrayWithCovariance, "/ground_truth/cones", self.cb_cones, q_cones)
 
         self.get_logger().info(f"iJCBB up. Map cones: {self.n_map} (GT odom+cones)")
 
-    # --------- Odom handling ----------
+    # ---------- grid index ----------
+    def _build_grid_index(self):
+        pts = self.map_xy
+        self._xmin = float(np.min(pts[:,0]))
+        self._ymin = float(np.min(pts[:,1]))
+        self._cell = max(1e-3, self.grid_cell_m)
+        # map from (ix,iy) -> np.array of global indices
+        buckets = defaultdict(list)
+        ix = np.floor((pts[:,0] - self._xmin)/self._cell).astype(int)
+        iy = np.floor((pts[:,1] - self._ymin)/self._cell).astype(int)
+        for i, (gx,gy) in enumerate(zip(ix,iy)):
+            buckets[(int(gx), int(gy))].append(i)
+        # convert to arrays
+        self._grid = {k: np.array(v, dtype=int) for k,v in buckets.items()}
+
+    def _grid_query_ball(self, x: float, y: float, r: float) -> np.ndarray:
+        """Return candidate map indices within bbox around (x,y) of radius r using grid buckets."""
+        cs = self._cell
+        gx = int(math.floor((x - self._xmin)/cs))
+        gy = int(math.floor((y - self._ymin)/cs))
+        rad_cells = int(math.ceil(r / cs)) + 1  # +1 to be safe
+        cand_lists = []
+        for dx in range(-rad_cells, rad_cells+1):
+            for dy in range(-rad_cells, rad_cells+1):
+                key = (gx+dx, gy+dy)
+                arr = self._grid.get(key, None)
+                if arr is not None and arr.size:
+                    cand_lists.append(arr)
+        if not cand_lists:
+            return np.empty((0,), dtype=int)
+        return np.unique(np.concatenate(cand_lists))
+
+    # --------- Odom ----------
     def cb_odom(self, msg: Odometry):
         t = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
         x = msg.pose.pose.position.x
@@ -195,7 +228,6 @@ class IJCBBCore(Node):
             yr = wrap_angle(yaw - yaw0) / dt
         self.pose_latest = np.array([x,y,yaw], float)
         self.odom_buf.append((t,x,y,yaw,v,yr))
-        # trim
         tmin = t - self.odom_buffer_sec
         while self.odom_buf and self.odom_buf[0][0] < tmin:
             self.odom_buf.popleft()
@@ -232,9 +264,9 @@ class IJCBBCore(Node):
         dt_near = min(abs(t_query - t0), abs(t_query - t1))
         return np.array([x,y,yaw], float), dt_near, v, yr
 
-    # --------- Cones callback (main hot path) ----------
+    # --------- Cones (hot path) ----------
     def cb_cones(self, msg: ConeArrayWithCovariance):
-        # Input-rate guard: process at ~target_cone_hz
+        # input-rate guard
         now_wall = time.time()
         if now_wall - self._last_proc_wall < self._proc_period:
             return
@@ -246,17 +278,15 @@ class IJCBBCore(Node):
         x,y,yaw = pose_w_b
         Rwb = rot2d(yaw); Rbw = Rwb.T
 
-        # Build observations in WORLD with base ranges
-        obs_pw = []      # list of 2-vectors
-        obs_pb_r = []    # scalar ranges in BASE
-        Sigma0_w = np.diag([self.sigma0**2, self.sigma0**2])
+        # Build observations in WORLD + base ranges
+        obs_pw = []
+        obs_pb_r = []
+        sigma0 = self.sigma0
+        Sigma0_w = np.array([[sigma0*sigma0, 0.0],[0.0, sigma0*sigma0]], float)  # constant addend
 
         def add(arr):
             for c in arr:
                 px = float(c.point.x); py = float(c.point.y)
-                Pw = np.array([[c.covariance[0], c.covariance[1]],
-                               [c.covariance[2], c.covariance[3]]], float)
-                Pw = Pw + np.diag([self.sigma0**2, self.sigma0**2])
                 if self.detections_frame == "base":
                     pb = np.array([px,py], float)
                     pw = np.array([x,y]) + Rwb @ pb
@@ -271,48 +301,69 @@ class IJCBBCore(Node):
         if n_obs == 0:
             return
 
-        # Vectorized nearby crop
-        crop2 = self.map_crop_m**2
         map_xy = self.map_xy
+        crop_r = self.map_crop_m
+        crop2 = crop_r*crop_r
+        topK = self.top_k_per_obs
 
         cand_per_obs: List[np.ndarray] = []
         mahal_costs:  List[np.ndarray] = []
 
-        # Per-obs inflated cov + Cholesky
+        # Per-obs inflation + grid crop + Mahalanobis (via Cholesky solve)
         for i in range(n_obs):
             pw = obs_pw[i]
             r  = obs_pb_r[i]
-            trans_var = self.alpha * (v**2) * (dt_pose**2)
-            lateral_var = self.beta * (yawrate**2) * (dt_pose**2) * (r**2)
-            Jrot = Rwb @ np.array([[0.0,0.0],[0.0,lateral_var]]) @ Rbw
-            S = Sigma0_w + np.diag([trans_var, trans_var]) + Jrot
 
-            # crop candidates by Euclid
-            diffs = map_xy - pw
-            d2 = np.einsum('ij,ij->i', diffs, diffs)
-            near = np.where(d2 <= crop2)[0]
-            if near.size == 0:
+            trans_var   = self.alpha * (v**2) * (dt_pose**2)
+            lateral_var = self.beta  * (yawrate**2) * (dt_pose**2) * (r**2)
+            Jrot = Rwb @ np.array([[0.0, 0.0],[0.0, lateral_var]]) @ Rbw
+            S = Sigma0_w + np.array([[trans_var,0.0],[0.0,trans_var]], float) + Jrot
+
+            # spatial hash query -> nearby cell candidates
+            near_idx = self._grid_query_ball(pw[0], pw[1], crop_r)
+            if near_idx.size == 0:
                 cand_per_obs.append(np.empty((0,), dtype=int))
                 mahal_costs.append(np.empty((0,), dtype=float))
                 continue
 
+            # Euclidean prefilter inside r (tighten from bbox)
+            diffs = map_xy[near_idx] - pw
+            d2 = np.einsum('ij,ij->i', diffs, diffs)
+            within = near_idx[d2 <= crop2]
+            if within.size == 0:
+                cand_per_obs.append(np.empty((0,), dtype=int))
+                mahal_costs.append(np.empty((0,), dtype=float))
+                continue
+
+            # Cholesky; compute m2 via solve (no explicit inverse)
             try:
                 L = np.linalg.cholesky(S)
-                Linv = np.linalg.inv(L)
-                Sinv = Linv.T @ Linv
+                # Solve L * Y = innov^T   -> Y has shape (2,K)
+                innov = (pw - map_xy[within]).T  # (2,K)
+                Y = np.linalg.solve(L, innov)    # (2,K)
+                m2 = np.einsum('ik,ik->k', Y, Y)
             except np.linalg.LinAlgError:
+                # If S not PD, fall back to pseudo-inverse path
                 Sinv = np.linalg.pinv(S)
+                innov = pw - map_xy[within]      # (K,2)
+                m2 = np.einsum('ij,ij->i', innov @ Sinv, innov)
 
-            innovs = pw - map_xy[near]        # shape [K,2]
-            m2 = np.einsum('ij,ij->i', innovs @ Sinv, innovs)
+            # gate by chi2
             keep = np.where(m2 <= self.chi2_gate)[0]
             if keep.size == 0:
                 cand_per_obs.append(np.empty((0,), dtype=int))
                 mahal_costs.append(np.empty((0,), dtype=float))
+                continue
+
+            # sort by cost asc; cap to topK (keeps accuracy w/ tight gates)
+            if keep.size > topK:
+                kk = keep[np.argpartition(m2[keep], topK)[:topK]]
+                kk = kk[np.argsort(m2[kk])]
             else:
                 kk = keep[np.argsort(m2[keep])]
-                cand_per_obs.append(near[kk].astype(int))
-                mahal_costs.append(m2[kk])
+
+            cand_per_obs.append(within[kk].astype(int))
+            mahal_costs.append(m2[kk])
 
         # iJCBB-lite assign
         _, matched = ijcbb_assign(cand_per_obs, mahal_costs)

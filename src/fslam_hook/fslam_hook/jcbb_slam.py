@@ -14,18 +14,38 @@ from eufs_msgs.msg import ConeArrayWithCovariance
 
 BASE_DIR = Path(__file__).resolve().parents[0]
 
-CHI2_0p99 = {
-     2: 11.83,  4: 13.28,  6: 16.81,  8: 20.09, 10: 23.21,
-    12: 26.22, 14: 29.14, 16: 31.99, 18: 34.81, 20: 37.57,
-    22: 40.29, 24: 42.98, 26: 45.64, 28: 48.28, 30: 50.89,
-    32: 53.49, 34: 56.06, 36: 58.62, 38: 61.16, 40: 63.69,
-}
+# ---- Chi-square helpers ----
+# Wilson–Hilferty approximation for chi2 quantile: good enough for gating
+def _norm_ppf(p: float) -> float:
+    # Acklam rational approximation for inverse normal CDF
+    # max error ~4.5e-4, fine for gating
+    if p <= 0.0: return -float('inf')
+    if p >= 1.0: return  float('inf')
+    a1=-3.969683028665376e+01; a2= 2.209460984245205e+02; a3=-2.759285104469687e+02
+    a4= 1.383577518672690e+02; a5=-3.066479806614716e+01; a6= 2.506628277459239e+00
+    b1=-5.447609879822406e+01; b2= 1.615858368580409e+02; b3=-1.556989798598866e+02
+    b4= 6.680131188771972e+01; b5=-1.328068155288572e+01
+    c1=-7.784894002430293e-03; c2=-3.223964580411365e-01; c3=-2.400758277161838e+00
+    c4=-2.549732539343734e+00; c5= 4.374664141464968e+00; c6= 2.938163982698783e+00
+    d1= 7.784695709041462e-03; d2= 3.224671290700398e-01; d3= 2.445134137142996e+00
+    d4= 3.754408661907416e+00
+    plow  = 0.02425
+    phigh = 1 - plow
+    if p < plow:
+        q = math.sqrt(-2*math.log(p))
+        return (((((c1*q+c2)*q+c3)*q+c4)*q+c5)*q+c6)/((((d1*q+d2)*q+d3)*q+d4)*q+1)
+    if p > phigh:
+        q = math.sqrt(-2*math.log(1-p))
+        return -(((((c1*q+c2)*q+c3)*q+c4)*q+c5)*q+c6)/((((d1*q+d2)*q+d3)*q+d4)*q+1)
+    q = p-0.5; r = q*q
+    return (((((a1*r+a2)*r+a3)*r+a4)*r+a5)*r+a6)*q/(((((b1*r+b2)*r+b3)*r+b4)*r+b5)*r+1)
 
-def chi2_thresh(dof: int, joint_sig: float) -> float:
-    if abs(joint_sig - 0.99) < 1e-3:
-        return CHI2_0p99.get(dof, CHI2_0p99[max(k for k in CHI2_0p99 if k <= dof)])
-    base = CHI2_0p99.get(dof, CHI2_0p99[max(k for k in CHI2_0p99 if k <= dof)])
-    return base
+def chi2_quantile(dof: int, p: float) -> float:
+    # Wilson–Hilferty: X ≈ k*(1 - 2/(9k) + z*sqrt(2/(9k)))^3, z=Φ^{-1}(p)
+    k = max(1, int(dof))
+    z = _norm_ppf(p)
+    t = 1.0 - 2.0/(9.0*k) + z*math.sqrt(2.0/(9.0*k))
+    return k * (t**3)
 
 def rot2d(th):
     c,s = math.cos(th), math.sin(th)
@@ -64,8 +84,10 @@ class JCBBNode(Node):
         # params
         self.declare_parameter("detections_frame", "base")
         self.declare_parameter("map_crop_m", 28.0)
-        self.declare_parameter("chi2_gate_2d", 11.83)
-        self.declare_parameter("joint_sig", 0.95)
+        self.declare_parameter("chi2_gate_2d", 11.83)      # per-pair gate (≈99.7% for 2 dof)
+        self.declare_parameter("joint_sig", 0.95)          # joint set significance (tunable)
+        self.declare_parameter("joint_relax", 1.4)        # extra slack on joint gate (to absorb shared pose error)
+        self.declare_parameter("min_k_for_joint", 3)       # delay joint gate until k>=this
         self.declare_parameter("meas_sigma_floor_xy", 0.30)
         self.declare_parameter("alpha_trans", 0.9)
         self.declare_parameter("beta_rot", 0.9)
@@ -75,6 +97,7 @@ class JCBBNode(Node):
         self.declare_parameter("min_candidates", 0)
         self.declare_parameter("map_data_dir", "slam_utils/data")
         self.declare_parameter("max_pairs_print", 6)
+        
 
         # topics
         self.declare_parameter("pose_topic", "/odometry_integration/car_state")
@@ -85,6 +108,8 @@ class JCBBNode(Node):
         self.map_crop_m = float(p("map_crop_m").value)
         self.chi2_gate = float(p("chi2_gate_2d").value)
         self.joint_sig  = float(p("joint_sig").value)
+        self.joint_relax = float(p("joint_relax").value)
+        self.min_k_for_joint = int(p("min_k_for_joint").value)
         self.sigma0 = float(p("meas_sigma_floor_xy").value)
         self.alpha = float(p("alpha_trans").value)
         self.beta  = float(p("beta_rot").value)
@@ -115,8 +140,8 @@ class JCBBNode(Node):
         self.pose_latest = np.array([0.0,0.0,0.0], float)
         self._pose_feed_ready = False
 
-        # logging throttle
-        self._log_period = 0.5  # seconds
+        # logging throttle (every 0.5 s)
+        self._log_period = 0.5
         self._last_log_wall = 0.0
 
         q = QoSProfile(depth=100, reliability=QoSReliabilityPolicy.RELIABLE,
@@ -258,7 +283,7 @@ class JCBBNode(Node):
         order = sorted(range(n_obs), key=lambda i: len(cands[i]) if cands[i] else 9999)
         cands_ord = [cands[i] for i in order]
 
-        # JCBB search
+        # JCBB search (with delayed & relaxed joint gate)
         best_pairs: List[Tuple[int,int,float]] = []
         best_K = 0
         used = set()
@@ -266,22 +291,31 @@ class JCBBNode(Node):
         def dfs(idx, cur_pairs, cur_sum):
             nonlocal best_pairs, best_K
             cur_K = len(cur_pairs)
+
+            # bound on max possible matches
             if cur_K + (len(cands_ord)-idx) < best_K:
                 return
-            if cur_K>0:
+
+            # delayed joint gate (k >= min_k_for_joint)
+            if cur_K >= self.min_k_for_joint:
                 df = 2*cur_K
-                if cur_sum > chi2_thresh(df, self.joint_sig):
+                thresh = self.joint_relax * chi2_quantile(df, self.joint_sig)
+                if cur_sum > thresh:
                     return
+
             if idx == len(cands_ord):
                 if cur_K > best_K:
                     best_K = cur_K
                     best_pairs = cur_pairs.copy()
                 return
-            # skip
+
+            # Option: skip this obs
             dfs(idx+1, cur_pairs, cur_sum)
-            # try candidates
+
+            # Try candidates
             for (mid, m2) in cands_ord[idx]:
-                if mid in used: continue
+                if mid in used:
+                    continue
                 used.add(mid)
                 cur_pairs.append((order[idx], mid, m2))
                 dfs(idx+1, cur_pairs, cur_sum + m2)
@@ -314,7 +348,6 @@ class JCBBNode(Node):
         pass_dt = 0.0 if self._last_t is None else (t_z - self._last_t)
         self._last_t = t_z
         pass_dt_ms_str = f"{int(pass_dt*1000)}ms" if math.isfinite(pass_dt) else "inf"
-
         print(f"[jcbb] obs={n_obs} matched={n_match} pass_dt={pass_dt_ms_str} proc={proc_ms}ms")
 
 def main():
