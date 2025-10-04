@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ijcbb_min_fast.py — iJCBB-lite (GT odom + GT cones), optimized
+# ijcbb_min_fast.py — iJCBB-lite on PREDICTED ODOM + GT cones, optimized
 # Speed-ups:
 #  - Uniform-grid spatial hash for map crop (O(1)-ish candidate lookup)
 #  - Cholesky "solve" (no explicit Σ^-1)
@@ -7,6 +7,12 @@
 #  - Strong pruning in DFS
 # Accuracy:
 #  - Same gating + inflation + assignment policy as your iJCBB-lite
+#
+# Important:
+#  - Uses *predicted* odom for pose (default: /odometry_integration/car_state)
+#  - Uses GT cones by default (override cones_topic to switch)
+#  - SensorData QoS to avoid backlog
+#  - Throttled logs (log_period_s)
 
 import math, json, time, bisect
 from pathlib import Path
@@ -94,7 +100,7 @@ def ijcbb_assign(cand_per_obs: List[np.ndarray], mahal_costs: List[np.ndarray]) 
         # try candidates in ascending cost
         for j in range(mids.size):
             mid = int(mids[j])
-            if mid in used: 
+            if mid in used:
                 continue
             c = float(costs[j])
             used.add(mid); assign[oi]=mid
@@ -110,7 +116,7 @@ def ijcbb_assign(cand_per_obs: List[np.ndarray], mahal_costs: List[np.ndarray]) 
 # ---------- Node ----------
 class IJCBBCore(Node):
     def __init__(self):
-        super().__init__("fslam_ijcbb")
+        super().__init__("fslam_ijcbb", automatically_declare_parameters_from_overrides=True)
 
         # Params
         self.declare_parameter("detections_frame", "base")   # "base" or "world"
@@ -124,6 +130,10 @@ class IJCBBCore(Node):
         self.declare_parameter("target_cone_hz", 25.0)
         self.declare_parameter("map_data_dir", "slam_utils/data")
         self.declare_parameter("log_period_s", 0.5)
+
+        # Topics
+        self.declare_parameter("pose_topic", "/odometry_integration/car_state")  # PREDICTED odom topic
+        self.declare_parameter("cones_topic", "/ground_truth/cones")             # GT cones for now
 
         # Speed-tuning knobs (safe defaults)
         self.declare_parameter("top_k_per_obs", 24)          # cap on candidates after gating
@@ -140,6 +150,9 @@ class IJCBBCore(Node):
         self.extrap_cap = float(p("extrapolation_cap_ms").value) / 1000.0
         self.target_cone_hz = float(p("target_cone_hz").value)
         self.log_period = float(p("log_period_s").value)
+
+        self.pose_topic = str(p("pose_topic").value)
+        self.cones_topic = str(p("cones_topic").value)
 
         self.top_k_per_obs = int(p("top_k_per_obs").value)
         self.grid_cell_m   = float(p("grid_cell_m").value)
@@ -170,16 +183,17 @@ class IJCBBCore(Node):
         self._last_t = None
         self._last_log_wall = 0.0
 
-        # QoS — SensorData style (GT topics)
+        # QoS — SensorData style
         q_cones = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT,
                              durability=QoSDurabilityPolicy.VOLATILE, history=QoSHistoryPolicy.KEEP_LAST)
-        q_odom = QoSProfile(depth=20, reliability=QoSReliabilityPolicy.BEST_EFFORT,
-                            durability=QoSDurabilityPolicy.VOLATILE, history=QoSHistoryPolicy.KEEP_LAST)
+        q_odom  = QoSProfile(depth=20, reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                             durability=QoSDurabilityPolicy.VOLATILE, history=QoSHistoryPolicy.KEEP_LAST)
 
-        self.create_subscription(Odometry, "/ground_truth/odom", self.cb_odom, q_odom)
-        self.create_subscription(ConeArrayWithCovariance, "/ground_truth/cones", self.cb_cones, q_cones)
+        # Subscriptions (PREDICTED odom + cones)
+        self.create_subscription(Odometry, self.pose_topic, self.cb_odom, q_odom)
+        self.create_subscription(ConeArrayWithCovariance, self.cones_topic, self.cb_cones, q_cones)
 
-        self.get_logger().info(f"iJCBB up. Map cones: {self.n_map} (GT odom+cones)")
+        self.get_logger().info(f"iJCBB up. Map cones: {self.n_map} | pose={self.pose_topic} | cones={self.cones_topic}")
 
     # ---------- grid index ----------
     def _build_grid_index(self):
@@ -228,6 +242,7 @@ class IJCBBCore(Node):
             yr = wrap_angle(yaw - yaw0) / dt
         self.pose_latest = np.array([x,y,yaw], float)
         self.odom_buf.append((t,x,y,yaw,v,yr))
+        # trim
         tmin = t - self.odom_buffer_sec
         while self.odom_buf and self.odom_buf[0][0] < tmin:
             self.odom_buf.popleft()

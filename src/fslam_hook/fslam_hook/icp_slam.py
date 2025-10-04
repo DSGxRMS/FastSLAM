@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-# icp_da_node_fast.py
-#
-# ICP-based DA over a known (fixed) cone map — optimized
-# Hooks added:
-#  - SensorData QoS (BEST_EFFORT) to prevent backlog
-#  - Throttled logs (log_period_s)
-#  - Uniform-grid spatial hash:
-#      * fast union-of-candidates (map crop) per frame
-#      * fast per-iteration local NN (instead of O(N*M))
-#  - Mahalanobis via Cholesky "solve" (no explicit inverse)
-#
-# Accuracy unchanged: same inflation (alpha/beta), same per-pair chi2 gate,
-# same greedy uniqueness for the final associations.
+# icp_da_node_fast.py  (predicted odom + GT cones)  — FIXED inf->int crash
 
 import math, json, time, bisect
 from collections import deque, defaultdict
@@ -27,7 +15,6 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy, QoS
 from nav_msgs.msg import Odometry
 from eufs_msgs.msg import ConeArrayWithCovariance
 
-# ---------- helpers ----------
 def rot2d(th: float) -> np.ndarray:
     c,s = math.cos(th), math.sin(th)
     return np.array([[c,-s],[s,c]], float)
@@ -60,12 +47,10 @@ def load_known_map(csv_path: Path):
         rows.append((x,y,c))
     return rows
 
-# ---------- ICP node ----------
 class ICPDANode(Node):
     def __init__(self):
-        super().__init__("fslam_icp")
+        super().__init__("fslam_icp", automatically_declare_parameters_from_overrides=True)
 
-        # Core params
         self.declare_parameter("detections_frame", "base")
         self.declare_parameter("map_crop_m", 25.0)
         self.declare_parameter("chi2_gate_2d", 11.83)
@@ -77,16 +62,17 @@ class ICPDANode(Node):
         self.declare_parameter("target_cone_hz", 25.0)
         self.declare_parameter("map_data_dir", "slam_utils/data")
         self.declare_parameter("max_pairs_print", 6)
-        # ICP params
         self.declare_parameter("icp_max_iter", 10)
         self.declare_parameter("icp_tol_xy", 1e-3)
         self.declare_parameter("icp_tol_yaw_deg", 0.05)
         self.declare_parameter("icp_trim_frac", 0.25)
         self.declare_parameter("icp_nn_clip_m", 3.0)
-        # Hooks
         self.declare_parameter("log_period_s", 0.5)
-        self.declare_parameter("grid_cell_m", 6.0)         # spatial hash cell size
-        self.declare_parameter("nn_search_r_m", 4.0)       # per-iter local NN search radius
+        self.declare_parameter("grid_cell_m", 6.0)
+        self.declare_parameter("nn_search_r_m", 4.0)
+
+        self.declare_parameter("pose_topic", "/odometry_integration/car_state")  # PREDICTED pose
+        self.declare_parameter("cones_topic", "/ground_truth/cones")             # GT cones
 
         p = self.get_parameter
         self.detections_frame = str(p("detections_frame").value).lower()
@@ -110,7 +96,9 @@ class ICPDANode(Node):
         self.grid_cell_m  = float(p("grid_cell_m").value)
         self.nn_search_r  = float(p("nn_search_r_m").value)
 
-        # Map load + alignment
+        self.pose_topic   = str(p("pose_topic").value)
+        self.cones_topic  = str(p("cones_topic").value)
+
         data_dir = (Path(__file__).resolve().parents[0] / str(p("map_data_dir").value)).resolve()
         align_json = data_dir / "alignment_transform.json"
         known_map_csv = data_dir / "known_map.csv"
@@ -122,32 +110,30 @@ class ICPDANode(Node):
         t_map = np.array(T["translation"], float)
         rows = load_known_map(known_map_csv)
         M = np.array([[x,y] for (x,y,_) in rows], float)
-        self.MAP = (M @ R_map.T) + t_map    # [Nmap,2]
+        self.MAP = (M @ R_map.T) + t_map
 
-        # Build spatial hash for the global map once
         self._build_grid_index(self.MAP)
 
-        # State
-        self.odom_buf: deque = deque()  # (t,x,y,yaw,v,yawrate)
+        self.odom_buf: deque = deque()
         self.pose_latest = np.array([0.0,0.0,0.0], float)
         self._proc_period = 1.0 / max(1e-3, self.target_cone_hz)
         self._last_proc_wall = 0.0
         self._last_t = None
         self._last_log_wall = 0.0
 
-        # QoS — SensorData style (BEST_EFFORT)
         q_cones = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT,
                              durability=QoSDurabilityPolicy.VOLATILE, history=QoSHistoryPolicy.KEEP_LAST)
         q_odom  = QoSProfile(depth=20, reliability=QoSReliabilityPolicy.BEST_EFFORT,
                              durability=QoSDurabilityPolicy.VOLATILE, history=QoSHistoryPolicy.KEEP_LAST)
 
-        # GT topics (adjust if needed)
-        self.create_subscription(Odometry, "/ground_truth/odom", self.cb_odom, q_odom)
-        self.create_subscription(ConeArrayWithCovariance, "/ground_truth/cones", self.cb_cones, q_cones)
+        self.create_subscription(Odometry, self.pose_topic, self.cb_odom, q_odom)
+        self.create_subscription(ConeArrayWithCovariance, self.cones_topic, self.cb_cones, q_cones)
 
-        self.get_logger().info(f"ICP up. Map cones: {self.MAP.shape[0]} (SensorData QoS, grid accel)")
+        self.get_logger().info(
+            f"ICP up. Map cones: {self.MAP.shape[0]} | pose={self.pose_topic} | cones={self.cones_topic} "
+            f"(SensorData QoS, grid accel)"
+        )
 
-    # ---------- spatial hash over fixed MAP ----------
     def _build_grid_index(self, pts: np.ndarray):
         self._xmin = float(np.min(pts[:,0]))
         self._ymin = float(np.min(pts[:,1]))
@@ -175,7 +161,7 @@ class ICPDANode(Node):
             return np.empty((0,), dtype=int)
         return np.unique(np.concatenate(cand_lists))
 
-    # ---------- odom ----------
+    # ---------------- ODOM ----------------
     def cb_odom(self, msg: Odometry):
         t = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
         x = msg.pose.pose.position.x
@@ -195,8 +181,9 @@ class ICPDANode(Node):
             self.odom_buf.popleft()
 
     def _pose_at(self, t_query: float):
+        # FIX 1: return finite dt (0.0) before any odom exists
         if not self.odom_buf:
-            return self.pose_latest.copy(), float('inf'), 0.0, 0.0
+            return self.pose_latest.copy(), 0.0, 0.0, 0.0
         times = [it[0] for it in self.odom_buf]
         idx = bisect.bisect_left(times, t_query)
         if idx == 0:
@@ -226,7 +213,7 @@ class ICPDANode(Node):
         dt_near = min(abs(t_query - t0), abs(t_query - t1))
         return np.array([x,y,yaw], float), dt_near, v, yr
 
-    # ---------- rigid solver ----------
+    # -------------- ICP tools --------------
     @staticmethod
     def _rigid_solve_2d(A: np.ndarray, B: np.ndarray):
         if A.shape[0] == 0:
@@ -251,9 +238,8 @@ class ICPDANode(Node):
         S[0,0]+=1e-9; S[1,1]+=1e-9
         return S
 
-    # ---------- ICP + DA ----------
+    # -------------- ICP + DA --------------
     def cb_cones(self, msg: ConeArrayWithCovariance):
-        # throttle to ~target_cone_hz
         now_wall = time.time()
         if now_wall - self._last_proc_wall < self._proc_period:
             return
@@ -265,7 +251,6 @@ class ICPDANode(Node):
         x,y,yaw = pose_w_b
         Rwb = rot2d(yaw); Rbw = Rwb.T
 
-        # Build obs (WORLD) and base-range
         obs_pw=[]; obs_pb=[]; obs_S0=[]
         def add(arr):
             for c in arr:
@@ -288,17 +273,15 @@ class ICPDANode(Node):
         if n_obs == 0:
             return
 
-        obs_pw = np.vstack(obs_pw)        # Nx2
-        obs_pb = np.vstack(obs_pb)        # Nx2
-        obs_S0 = np.stack(obs_S0)         # Nx2x2
+        obs_pw = np.vstack(obs_pw)
+        obs_pb = np.vstack(obs_pb)
+        obs_S0 = np.stack(obs_S0)
 
-        # --- Fast union-of-candidates from spatial hash ---
         crop_r = self.map_crop_m
         union_ids = set()
         for pw in obs_pw:
             idxs = self._grid_query_ball_ids(pw[0], pw[1], crop_r)
             if idxs.size:
-                # refine: keep within radius
                 diffs = self.MAP[idxs] - pw
                 d2 = np.einsum('ij,ij->i', diffs, diffs)
                 keep = idxs[d2 <= (crop_r*crop_r)]
@@ -308,65 +291,42 @@ class ICPDANode(Node):
             self._print_line(t_z, dt_pose, v, n_obs, 0, 0, 0.0, int((time.perf_counter()-t0)*1000), [])
             return
 
-        cand_ids = np.array(sorted(list(union_ids)), dtype=int)   # global map indices
-        C = self.MAP[cand_ids]                                    # Mx2
-        # index: global map id -> row in C
+        cand_ids = np.array(sorted(list(union_ids)), dtype=int)
+        C = self.MAP[cand_ids]
         idx_in_C = {int(mid): i for i, mid in enumerate(cand_ids)}
 
-        # Build a grid for C (subset) by reusing the global grid areas implicitly:
-        # we'll query global grid and then filter to subset via idx_in_C.
-
-        # --- ICP iterations (obs -> map), with LOCAL NN via grid ---
         R_icp = np.eye(2); t_icp = np.zeros(2)
         Pw_cur = obs_pw.copy()
         iters = 0
         for it in range(self.icp_max_iter):
             iters = it + 1
-
-            # For each transformed obs point, fetch nearby candidate map points from grid
-            # within nn_search_r (≥ icp_nn_clip). Then choose nearest among those (not all M).
             nn_idx = np.empty(Pw_cur.shape[0], dtype=int)
             nn_d   = np.empty(Pw_cur.shape[0], dtype=float)
-
             r_nn = max(self.nn_search_r, self.icp_nn_clip)
             for i, p in enumerate(Pw_cur):
                 idxs = self._grid_query_ball_ids(p[0], p[1], r_nn)
                 if idxs.size == 0:
-                    nn_idx[i] = 0
-                    nn_d[i] = 1e9
-                    continue
-                # keep only indices that are members of C
-                # map global->row in C
+                    nn_idx[i] = 0; nn_d[i] = 1e9; continue
                 rows = [idx_in_C.get(int(mid), -1) for mid in idxs]
                 rows = np.array([r for r in rows if r >= 0], dtype=int)
                 if rows.size == 0:
-                    nn_idx[i] = 0
-                    nn_d[i] = 1e9
-                    continue
-                cand = C[rows]                # kx2
+                    nn_idx[i] = 0; nn_d[i] = 1e9; continue
+                cand = C[rows]
                 d2 = np.sum((cand - p)**2, axis=1)
                 jloc = int(np.argmin(d2))
-                nn_idx[i] = rows[jloc]        # row in C
+                nn_idx[i] = rows[jloc]
                 nn_d[i] = math.sqrt(float(d2[jloc]))
 
             keep = np.ones(n_obs, dtype=bool)
             if self.icp_trim > 0.0 and n_obs >= 4:
-                k = int((1.0 - self.icp_trim) * n_obs)
-                k = max(3, min(n_obs, k))
-                order = np.argsort(nn_d)
-                keep[:] = False
-                keep[order[:k]] = True
-
+                k = int((1.0 - self.icp_trim) * n_obs); k = max(3, min(n_obs, k))
+                order = np.argsort(nn_d); keep[:] = False; keep[order[:k]] = True
             if self.icp_nn_clip > 0.0:
                 keep &= (nn_d <= self.icp_nn_clip)
+            if keep.sum() < 3: break
 
-            if keep.sum() < 3:
-                break
-
-            A = Pw_cur[keep]
-            B = C[nn_idx[keep]]
+            A = Pw_cur[keep]; B = C[nn_idx[keep]]
             R_d, t_d = self._rigid_solve_2d(A, B)
-
             R_icp = R_d @ R_icp
             t_icp = R_d @ t_icp + t_d
             Pw_cur = (obs_pw @ R_icp.T) + t_icp
@@ -376,47 +336,35 @@ class ICPDANode(Node):
             if (math.hypot(dx,dy) < self.icp_tol_xy) and (abs(dyaw) < self.icp_tol_yaw):
                 break
 
-        # Final local NN (one more time) to compute RMSE and candidates
         r_nn = max(self.nn_search_r, self.icp_nn_clip)
         d_list=[]; nn_idx_final = np.empty(n_obs, dtype=int)
         for i, p in enumerate(Pw_cur):
             idxs = self._grid_query_ball_ids(p[0], p[1], r_nn)
             if idxs.size == 0:
-                nn_idx_final[i] = 0
-                d_list.append(1e9)
-                continue
+                nn_idx_final[i] = 0; d_list.append(1e9); continue
             rows = [idx_in_C.get(int(mid), -1) for mid in idxs]
             rows = np.array([r for r in rows if r >= 0], dtype=int)
             if rows.size == 0:
-                nn_idx_final[i] = 0
-                d_list.append(1e9)
-                continue
+                nn_idx_final[i] = 0; d_list.append(1e9); continue
             cand = C[rows]
             d2 = np.sum((cand - p)**2, axis=1)
             jloc = int(np.argmin(d2))
             nn_idx_final[i] = rows[jloc]
             d_list.append(math.sqrt(float(d2[jloc])))
-
         nn_d_final = np.array(d_list, float)
-        if nn_d_final.size:
-            rmse = float(np.sqrt(np.mean(np.minimum(nn_d_final**2, (self.icp_nn_clip**2)))))
-        else:
-            rmse = 0.0
+        rmse = float(np.sqrt(np.mean(np.minimum(nn_d_final**2, (self.icp_nn_clip**2))))) if nn_d_final.size else 0.0
 
-        # --- Per-obs inflate + Mahalanobis gate (Cholesky solve) + one-to-one greedy ---
         matches = []
         for i in range(n_obs):
             j = int(nn_idx_final[i])
             if j < 0 or j >= C.shape[0]:
                 continue
-            # inflate
             r_obs = float(np.linalg.norm(obs_pb[i]))
             S_eff = self._inflate_cov(obs_S0[i], v, yawrate, dt_pose, r_obs, yaw)
-            # m² via Cholesky
             innov = Pw_cur[i] - C[j]
             try:
                 L = np.linalg.cholesky(S_eff)
-                y = np.linalg.solve(L, innov)   # L y = innov
+                y = np.linalg.solve(L, innov)
                 m2 = float(y @ y)
             except np.linalg.LinAlgError:
                 Sinv = np.linalg.pinv(S_eff)
@@ -424,14 +372,11 @@ class ICPDANode(Node):
             if m2 <= self.chi2_gate:
                 matches.append((i, int(cand_ids[j]), m2))
 
-        # uniqueness: greedily by smallest m²
         matches.sort(key=lambda t: t[2])
-        used_cols = set()
-        final=[]
+        used_cols = set(); final=[]
         for (oi, mid, m2) in matches:
             if mid in used_cols: continue
-            used_cols.add(mid)
-            final.append((oi, mid, m2))
+            used_cols.add(mid); final.append((oi, mid, m2))
 
         show=[]
         for (oi, mid, m2) in final[:min(self.max_pairs_print, len(final))]:
@@ -440,7 +385,7 @@ class ICPDANode(Node):
         proc_ms = int((time.perf_counter()-t0)*1000)
         self._print_line(t_z, dt_pose, v, n_obs, len(final), iters, rmse, proc_ms, show)
 
-    # ---------- logging ----------
+    # ---------------- logging ----------------
     def _print_line(self, t_z, dt_pose, v, n_obs, n_match, iters, rmse, proc_ms, show_pairs):
         now = time.time()
         if (now - self._last_log_wall) < self.log_period:
@@ -448,13 +393,18 @@ class ICPDANode(Node):
         self._last_log_wall = now
         pass_dt = 0.0 if self._last_t is None else (t_z - self._last_t)
         self._last_t = t_z
-        base = (f"[icp] pass_dt={int(pass_dt*1000)}ms  Δt_pose={int(dt_pose*1000)}ms  v={v:.2f}m/s  "
+
+        # FIX 2: guard non-finite values before int()
+        dp_ms = 0 if (not math.isfinite(dt_pose)) else int(dt_pose*1000)
+        pd_ms = 0 if (not math.isfinite(pass_dt)) else int(pass_dt*1000)
+        vv = 0.0 if (not math.isfinite(v)) else v
+
+        base = (f"[icp] pass_dt={pd_ms}ms  Δt_pose={dp_ms}ms  v={vv:.2f}m/s  "
                 f"obs={n_obs}  matched={n_match}  iters={iters}  rmse={rmse:.3f}m  proc={proc_ms}ms")
         if show_pairs:
             base += " | " + ", ".join(show_pairs)
         print(base)
 
-# ---------- main ----------
 def main():
     rclpy.init()
     node = ICPDANode()
