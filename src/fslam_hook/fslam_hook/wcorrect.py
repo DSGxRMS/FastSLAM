@@ -2,8 +2,35 @@
 # ws_ekf_localizer.py
 # ROS2 rclpy — IMU prediction (exactly as your predictor) + Wheel-speed correction (EKF), NO perception.
 #
-# Publishes Odometry on /odometry_integration/car_state
-# Waits for bias lock (bias_window_s), then runs for active_seconds and plots.
+# Outputs only after wheel corrections. Runs 60 s after bias window, then plots:
+#   - XY: GT vs IMU-prediction vs Corrected
+#   - Speed: Corrected vs GT
+#   - Yaw:   Corrected vs GT
+#
+# Publishes:
+#   - Odometry on topics.out_odom (default: /odometry_integration/car_state)
+#   - Pose2D  on topics.out_pose2d (default: /odometry_integration/pose2d)  <-- requested XY(+theta)
+#
+# Tunables (ROS params):
+#   topics.imu:=/imu/data
+#   topics.wheels:=/ros_can/wheel_speeds
+#   topics.gt_odom:=/ground_truth/odom
+#   topics.out_odom:=/odometry_integration/car_state
+#   topics.out_pose2d:=/odometry_integration/pose2d
+#   run.bias_window_s:=5.0
+#   run.active_seconds:=60.0
+#   log.cli_hz:=1.0
+#   input.imu_use_rate_hz:=0.0         # 0 = use every IMU sample
+#   input.target_wheel_hz:=400.0       # throttle wheel corrections
+#   proc.sigma_acc:=0.0                # keep 0.0 to match your predictor
+#   proc.sigma_yaw:=0.0                # keep 0.0 to match your predictor
+#   init.sigma_v:=0.0                  # keep 0.0 to match your predictor start
+#   vel_leak_hz:=0.0                   # like your script (0 disables)
+#   wheel.radius_m:=0.253
+#   wheel.rpm_min:=5.0
+#   wheel.sigma_base:=0.35             # m/s baseline meas sigma
+#   wheel.k_turn:=1.0                  # inflate with |yawrate|
+#   wheel.k_acc:=0.5                   # inflate with |a|
 #
 import math, time, bisect
 import numpy as np
@@ -17,6 +44,7 @@ from sensor_msgs.msg import Imu
 from nav_msgs.msg import Odometry
 from eufs_msgs.msg import WheelSpeedsStamped
 from geometry_msgs.msg import Quaternion as QuaternionMsg
+from geometry_msgs.msg import Pose2D
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -58,6 +86,7 @@ class ImuWheelEKF(Node):
         self.declare_parameter("topics.wheels", "/ros_can/wheel_speeds")
         self.declare_parameter("topics.gt_odom", "/ground_truth/odom")
         self.declare_parameter("topics.out_odom", "/odometry_integration/car_state")
+        self.declare_parameter("topics.out_pose2d", "/odometry_integration/pose2d")  # NEW
 
         self.declare_parameter("run.bias_window_s", 5.0)
         self.declare_parameter("run.active_seconds", 60.0)
@@ -66,7 +95,7 @@ class ImuWheelEKF(Node):
         self.declare_parameter("input.imu_use_rate_hz", 0.0)   # 0 = use all IMU
         self.declare_parameter("input.target_wheel_hz", 400.0)
 
-        # Keep defaults at 0.0 so prediction matches your predictor exactly.
+        # Keep defaults at 0.0 so prediction matches YOUR script exactly.
         self.declare_parameter("proc.sigma_acc", 0.0)          # m/s^2 world-frame noise
         self.declare_parameter("proc.sigma_yaw", 0.0)          # rad / sqrt(s)
         self.declare_parameter("init.sigma_v", 0.0)            # m/s
@@ -83,6 +112,7 @@ class ImuWheelEKF(Node):
         self.topic_wheel = str(P("topics.wheels"))
         self.topic_gt    = str(P("topics.gt_odom"))
         self.topic_out   = str(P("topics.out_odom"))
+        self.topic_pose2d= str(P("topics.out_pose2d"))  # NEW
 
         self.bias_window_s = float(P("run.bias_window_s"))
         self.active_seconds = float(P("run.active_seconds"))
@@ -148,6 +178,7 @@ class ImuWheelEKF(Node):
         self.create_subscription(Odometry, self.topic_gt, self.cb_gt, qos_rel)
 
         self.pub_out = self.create_publisher(Odometry, self.topic_out, 10)
+        self.pub_pose2d = self.create_publisher(Pose2D, self.topic_pose2d, 10)  # NEW
         self.create_timer(max(0.05, 1.0/self.cli_hz), self.on_cli_timer)
 
         self.get_logger().info(
@@ -176,7 +207,7 @@ class ImuWheelEKF(Node):
         Rwb = rot3_from_quat(q.x,q.y,q.z,q.w)  # world_from_body
         yaw_q = yaw_from_quat(q.x,q.y,q.z,q.w)
 
-        # Bias lock window
+        # Bias lock window — same as your script
         if not self.bias_locked and (t - self.bias_t0) <= self.bias_window_s:
             a = np.array([ax,ay,az], float)
             w = np.array([gx,gy,gz], float)
@@ -185,15 +216,13 @@ class ImuWheelEKF(Node):
             self.last_imu_t = t
             return
         elif not self.bias_locked:
-            if self._acc_buf:
-                self.acc_b = np.mean(np.array(self._acc_buf), axis=0)
-            if self._gz_buf:
-                self.gz_b = float(np.mean(self._gz_buf))
+            if self._acc_buf: self.acc_b = np.mean(np.array(self._acc_buf), axis=0)
+            if self._gz_buf:  self.gz_b  = float(np.mean(self._gz_buf))
             self.bias_locked = True
             self.bias_locked_time_wall = time.time()
             self.stop_wall = self.bias_locked_time_wall + self.active_seconds
-            self.get_logger().info(f"[WS-EKF] Bias locked: acc_b={self.acc_b.round(4).tolist()} m/s², gyro_bz={self.gz_b:.5f} rad/s — starting drive.")
-            # Init yaw & velocities
+            self.get_logger().info(f"[WS-EKF] Bias locked: acc_b={self.acc_b.round(4).tolist()} m/s², gyro_bz={self.gz_b:.5f} rad/s")
+            # Init state to IMU yaw; velocities optionally random if init_sigma_v>0 (off by default)
             self.x[2] = yaw_q
             if self.init_sigma_v > 0.0:
                 self.x[3] = np.random.normal(0.0, self.init_sigma_v)
@@ -202,20 +231,18 @@ class ImuWheelEKF(Node):
             self._last_imu_proc_t = None
             return
 
-        # Optional downsample of IMU processing
         if self.imu_use_rate_hz > 0.0 and self._last_imu_proc_t is not None:
             if (t - self._last_imu_proc_t) < (1.0 / self.imu_use_rate_hz):
                 self.last_imu_t = t
                 return
 
-        # dt
         if self.last_imu_t is None:
             self.last_imu_t = t
             self.x[2] = yaw_q
             self._last_imu_proc_t = t
             return
         dt = t - self.last_imu_t
-        if dt <= 0.0 or dt > 0.05:
+        if dt <= 0.0 or dt > 0.05:  # same guard as your script
             self.last_imu_t = t
             return
         self.last_imu_t = t
@@ -228,13 +255,10 @@ class ImuWheelEKF(Node):
         # Gravity compensation in WORLD
         a_world3 = Rwb @ a_body - np.array([0.0,0.0,G])
         ax_w, ay_w = float(a_world3[0]), float(a_world3[1])
-
-        # Save helpers
         self.last_axw = math.hypot(ax_w, ay_w)
         self.last_yawrate = gz_c
 
         # -------- Prediction (match your equations) --------
-        # state: [x, y, yaw, vx, vy]
         xk = self.x.copy()
         xk[2] = wrap(xk[2] + gz_c*dt)
         leak = math.exp(-self.vel_leak_hz * dt) if self.vel_leak_hz > 0.0 else 1.0
@@ -244,46 +268,28 @@ class ImuWheelEKF(Node):
         xk[1] += xk[4]*dt
         self.x = xk
 
-        # Covariance propagation
-        A = np.array([
-            [1, 0, 0, dt, 0 ],
-            [0, 1, 0, 0,  dt],
-            [0, 0, 1, 0,  0 ],
-            [0, 0, 0, 1,  0 ],
-            [0, 0, 0, 0,  1 ],
-        ], float)
-        sig_a = self.sigma_acc
-        sig_y = self.sigma_yaw
-        Qd = np.diag([
-            (0.5*dt*dt*sig_a)**2,
-            (0.5*dt*dt*sig_a)**2,
-            (sig_y*math.sqrt(dt))**2,
-            (dt*sig_a)**2,
-            (dt*sig_a)**2
-        ])
+        # Covariance propagation (kept minimal; default Q=0 to mirror your predictor)
+        A = np.array([[1,0,0,dt,0],[0,1,0,0,dt],[0,0,1,0,0],[0,0,0,1,0],[0,0,0,0,1]], float)
+        sig_a = self.sigma_acc; sig_y = self.sigma_yaw
+        Qd = np.diag([(0.5*dt*dt*sig_a)**2,(0.5*dt*dt*sig_a)**2,(sig_y*math.sqrt(dt))**2,(dt*sig_a)**2,(dt*sig_a)**2])
         self.P = A @ self.P @ A.T + Qd
 
         # Log prediction-only (for XY overlay)
         v_pred = float(math.hypot(self.x[3], self.x[4]))
         self.pred_log.append((t, self.x[0], self.x[1], self.x[2], v_pred))
 
-        # Stop after active window
         if self.stop_wall and time.time() >= self.stop_wall:
             self.get_logger().info("[WS-EKF] Run time reached — generating plots.")
-            try:
-                self._plots_and_exit()
-            finally:
-                rclpy.shutdown()
+            try: self._plots_and_exit()
+            finally: rclpy.shutdown()
 
     def cb_wheel(self, msg: WheelSpeedsStamped):
         if not self.bias_locked or self.last_imu_t is None:
             return
         t = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9 if msg.header.stamp else self.last_imu_t
-        # Throttle
         if self._last_wheel_t is not None and (t - self._last_wheel_t) < (1.0 / max(1e-3, self.target_wheel_hz)):
             return
         self._last_wheel_t = t
-        # Causal
         if t > self.last_imu_t:
             return
 
@@ -294,11 +300,9 @@ class ImuWheelEKF(Node):
         omega = rpm * (2.0 * math.pi / 60.0)
         z = max(0.0, omega * self.Rw)  # measured speed magnitude
 
-        # Adaptive R
         sigma_v = self.w_sigma_base * (1.0 + self.w_k_turn * abs(self.last_yawrate) + self.w_k_acc * abs(self.last_axw))
         Rm = max(0.05, min(3.0, sigma_v)) ** 2
 
-        # ---- EKF Update: z = sqrt(vx^2 + vy^2) ----
         vx, vy = self.x[3], self.x[4]
         vhat = math.hypot(vx, vy)
         if vhat < 1e-6:
@@ -314,12 +318,10 @@ class ImuWheelEKF(Node):
         self.x += K * innov
         self.x[2] = wrap(self.x[2])
 
-        # Joseph form
         I = np.eye(5)
         KH = np.outer(K, H)
         self.P = (I - KH) @ self.P @ (I - KH).T + np.outer(K, K) * Rm
 
-        # Publish fused state AFTER correction
         self._publish_output(self.last_imu_t)
 
     # ---------- CLI + helpers ----------
@@ -372,6 +374,7 @@ class ImuWheelEKF(Node):
         self.corr_log.append((t, x, y, yaw, v))
         self.last_output = (t, x, y, yaw, v)
 
+        # Odometry
         od = Odometry()
         od.header.stamp = rclpy.time.Time(seconds=t).to_msg()
         od.header.frame_id = "map"
@@ -385,6 +388,11 @@ class ImuWheelEKF(Node):
             angular=Vector3(x=0.0, y=0.0, z=self.last_yawrate)
         )
         self.pub_out.publish(od)
+
+        # Pose2D (XY + theta)
+        p2 = Pose2D()
+        p2.x = x; p2.y = y; p2.theta = yaw
+        self.pub_pose2d.publish(p2)
 
     # ---------- Plots ----------
     def _plots_and_exit(self):
@@ -416,7 +424,7 @@ class ImuWheelEKF(Node):
         plt.plot(Tc, np.unwrap(Yawc), label="Corrected yaw (rad)")
         plt.grid(True, ls='--', alpha=0.3); plt.legend(); plt.xlabel("time (s)"); plt.ylabel("rad"); plt.title("Yaw vs Time")
 
-        # Metrics (corrected)
+        # Metrics
         def interp(at_T, src_T, src_V): return np.interp(at_T, src_T, src_V)
         Xg_c = interp(Tc, Tg, Xg); Yg_c = interp(Tc, Tg, Yg)
         pos_rmse_corr = math.sqrt(np.mean((Xc - Xg_c)**2 + (Yc - Yg_c)**2))
@@ -429,6 +437,7 @@ class ImuWheelEKF(Node):
         print(f"Yaw MAE (corrected) = {yaw_mae_corr:.3f} °")
         plt.show()
 
+# ---------- main ----------
 def main():
     rclpy.init()
     node = ImuWheelEKF()

@@ -77,9 +77,9 @@ class JCBBNode(Node):
         # params
         self.declare_parameter("detections_frame", "base")
         self.declare_parameter("map_crop_m", 25.0)
-        self.declare_parameter("chi2_gate_2d", 13.28)
+        self.declare_parameter("chi2_gate_2d", 11.83)
         self.declare_parameter("joint_sig", 0.99)
-        self.declare_parameter("meas_sigma_floor_xy", 0.20)
+        self.declare_parameter("meas_sigma_floor_xy", 0.10)
         self.declare_parameter("alpha_trans", 0.8)
         self.declare_parameter("beta_rot", 0.8)
         self.declare_parameter("odom_buffer_sec", 2.0)
