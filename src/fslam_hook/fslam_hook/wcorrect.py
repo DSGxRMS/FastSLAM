@@ -55,7 +55,7 @@ class ImuWheelEKF(Node):
         self.declare_parameter("topics.out_pose2d", "/odometry_integration/pose2d")
 
         self.declare_parameter("run.bias_window_s", 5.0)
-        self.declare_parameter("run.active_seconds", 60.0)
+        self.declare_parameter("run.active_seconds", 30.0)
         self.declare_parameter("log.cli_hz", 1.0)
 
         self.declare_parameter("input.imu_use_rate_hz", 0.0)
@@ -79,7 +79,7 @@ class ImuWheelEKF(Node):
         self.declare_parameter("yawscale.v_min", 1.0)          # m/s, need motion
         self.declare_parameter("yawscale.gz_min", 0.05)        # rad/s, need turn
         self.declare_parameter("yawscale.k_min", 0.6)
-        self.declare_parameter("yawscale.k_max", 1.92)
+        self.declare_parameter("yawscale.k_max", 2.4)
         self.declare_parameter("yawscale.aperp_min", 0.4)      # m/s^2, reject noise
         self.declare_parameter("yawscale.par_over_perp_max", 0.5)  # |a_par| <= r * |a_perp|
 

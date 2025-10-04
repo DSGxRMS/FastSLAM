@@ -44,7 +44,7 @@ class FixedRouteDriver(Node):
         self.declare_parameter("radius_m", 10.15)               # circle radius
         self.declare_parameter("target_speed_mps", 5.4)
         self.declare_parameter("steering_right_sign", -1.0)     # -1: right turn negative (most sims). +1 if opposite.
-        self.declare_parameter("control_hz", 50.0)
+        self.declare_parameter("control_hz", 40.0)
 
         # accel controller (accel-first API)
         self.declare_parameter("accel_gain", 1.5)               # maps (v_target - v_meas) -> accel
