@@ -41,8 +41,8 @@ class FixedRouteDriver(Node):
         # -------- Params --------
         # kinematics / command
         self.declare_parameter("wheelbase_m", 1.5)
-        self.declare_parameter("radius_m", 10.125)               # circle radius
-        self.declare_parameter("target_speed_mps", 5.0)
+        self.declare_parameter("radius_m", 10.15)               # circle radius
+        self.declare_parameter("target_speed_mps", 5.4)
         self.declare_parameter("steering_right_sign", -1.0)     # -1: right turn negative (most sims). +1 if opposite.
         self.declare_parameter("control_hz", 50.0)
 
@@ -51,7 +51,7 @@ class FixedRouteDriver(Node):
         self.declare_parameter("accel_limit", 3.0)              # |m/s^2| clamp
 
         # segment lengths
-        self.declare_parameter("straight1_m", 17.0)
+        self.declare_parameter("straight1_m", 16.8)
         self.declare_parameter("straight2_m", 17.0)
 
         # topics
@@ -72,29 +72,38 @@ class FixedRouteDriver(Node):
         self.accel_gain      = float(val("accel_gain"))
         self.accel_limit     = float(val("accel_limit"))
 
-        self.seg1_len        = float(val("straight1_m"))   # <-- now reads 17.0, not 0.0
+        self.seg1_len        = float(val("straight1_m"))
         self.seg2_len        = float(val("straight2_m"))
 
         self.odom_topic      = str(val("odom_topic"))
         self.cmd_topic       = str(val("cmd_topic"))
         self.qos_best_effort = bool(val("qos_best_effort"))
 
-
         # -------- State machine --------
-        self.state = "WAIT_INIT"   # WAIT_INIT -> STRAIGHT1 -> CIRCLE -> STRAIGHT2 -> DONE
+        # WAIT_INIT -> STRAIGHT1 -> CIRCLE -> CIRCLE2 -> STRAIGHT2 -> DONE
+        self.state = "WAIT_INIT"
         self.p0 = (0.0, 0.0)       # start pos
         self.yaw0 = 0.0
         self.fwd0 = (1.0, 0.0)
 
         self.s1_progress = 0.0
 
-        self.p1 = (0.0, 0.0)       # circle entry
+        # Circle 1
+        self.p1 = (0.0, 0.0)       # circle1 entry
         self.yaw1 = 0.0
         self.center = (0.0, 0.0)
         self.theta_start = 0.0
         self.theta_progress = 0.0
 
-        self.p2 = (0.0, 0.0)       # circle exit
+        # Circle 2
+        self.p1b = (0.0, 0.0)      # circle2 entry
+        self.yaw1b = 0.0
+        self.center2 = (0.0, 0.0)
+        self.theta_start2 = 0.0
+        self.theta_progress2 = 0.0
+
+        # Exit to straight 2
+        self.p2 = (0.0, 0.0)
         self.yaw2 = 0.0
         self.fwd2 = (1.0, 0.0)
         self.s2_progress = 0.0
@@ -166,7 +175,7 @@ class FixedRouteDriver(Node):
             steering_cmd = 0.0
 
             if self.s1_progress >= self.seg1_len:
-                # enter circle
+                # enter circle 1
                 self.p1 = self.pos
                 self.yaw1 = self.yaw
                 n_hat = right_normal_from_yaw(self.yaw1) if self.right_sign < 0 else left_normal_from_yaw(self.yaw1)
@@ -189,6 +198,30 @@ class FixedRouteDriver(Node):
                 self.theta_progress = wrap_to_2pi(theta_now - self.theta_start)   # CCW for left turn
 
             if self.theta_progress >= (2.0 * math.pi - 1e-2):
+                # start second identical circle
+                self.p1b = self.pos
+                self.yaw1b = self.yaw
+                n_hat = right_normal_from_yaw(self.yaw1b) if self.right_sign < 0 else left_normal_from_yaw(self.yaw1b)
+                self.center2 = (self.p1b[0] + self.radius * n_hat[0],
+                                self.p1b[1] + self.radius * n_hat[1])
+                self.theta_start2 = math.atan2(self.p1b[1] - self.center2[1],
+                                               self.p1b[0] - self.center2[0])
+                self.theta_progress2 = 0.0
+                self.state = "CIRCLE2"
+                self.get_logger().info(f"[state] CIRCLE2 start center={self.center2} theta0={self.theta_start2:.3f}")
+
+        elif self.state == "CIRCLE2":
+            steering_cmd = self.delta_circle  # same radius & direction
+
+            theta_now2 = math.atan2(self.pos[1] - self.center2[1],
+                                    self.pos[0] - self.center2[0])
+            if self.right_sign < 0:
+                self.theta_progress2 = wrap_to_2pi(self.theta_start2 - theta_now2)
+            else:
+                self.theta_progress2 = wrap_to_2pi(theta_now2 - self.theta_start2)
+
+            if self.theta_progress2 >= (2.0 * math.pi - 1e-2):
+                # exit to straight2
                 self.p2 = self.pos
                 self.yaw2 = self.yaw
                 self.fwd2 = unit_vec_from_yaw(self.yaw2)
