@@ -1,9 +1,0 @@
-[console_scripts]
-calib = fslam_base.support_nodes.wheel_calib:main
-debug = fslam_base.fslam_viz:main
-fslam = fslam_base.fslam_localizer:main
-map_snap = fslam_base.support_nodes.cone_snapshot_node:main
-predict = fslam_base.predict:main
-predict_quat = fslam_base.predict_quat:main
-wheel_debug = fslam_base.support_nodes.wheel_check:main
-

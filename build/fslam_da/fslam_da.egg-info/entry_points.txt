@@ -1,7 +1,0 @@
-[console_scripts]
-filter = fslam_da.filter:main
-hungarian = fslam_da.hungarian:main
-icp = fslam_da.icp:main
-ijcbb = fslam_da.ijcbb:main
-jcbb = fslam_da.jcbb:main
-
