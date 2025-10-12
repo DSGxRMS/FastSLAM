@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
-# fslam_mapper.py  (time-aligned, colour-aware, proper gate S=P+Sw)
+# fslam_mapper.py — minimal online cone mapper (no CSV, no buffering, loose gates)
+#
+# Subscribes:
+#   - /odometry_integration/car_state (nav_msgs/Odometry)         <-- predictor pose
+#   - /ground_truth/cones (eufs_msgs/ConeArrayWithCovariance)     <-- perception (or your detector)
+#
+# Publishes:
+#   - /mapper/known_map (eufs_msgs/ConeArrayWithCovariance)       <-- live landmark map (cones only)
+#
+# Notes:
+#   - No loop closure. No time buffering. Uses latest odom only.
+#   - DA: colour-aware, chi-square gate, crop area.
+#   - Colours handled explicitly for: blue, yellow, orange, big_orange.
+#   - NEW: Perception throttle via da.target_cone_hz (0 = no throttle).
 
-import math, csv, time, bisect, signal, os
-from collections import deque
-from pathlib import Path
-from typing import Tuple, List
-
+import math
+from typing import List
 import numpy as np
+
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy, QoSHistoryPolicy
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from rclpy.time import Time as RclTime
 
 from nav_msgs.msg import Odometry
 from eufs_msgs.msg import ConeArrayWithCovariance, ConeWithCovariance
 
-# -------- helpers --------
+# ---------- helpers ----------
 def wrap(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
@@ -55,177 +66,146 @@ def chi2_quantile(dof: int, p: float) -> float:
     t = 1.0 - 2.0/(9.0*k) + z*math.sqrt(2.0/(9.0*k))
     return k * (t**3)
 
-def cone_array_append(arr: ConeArrayWithCovariance, x: float, y: float, cov_2x2: np.ndarray, color: str):
-    a = float(cov_2x2[0,0]); d = float(cov_2x2[1,1]); b = float(cov_2x2[0,1]); c = float(cov_2x2[1,0])
+def add_cone(arr: ConeArrayWithCovariance, x: float, y: float, P: np.ndarray, color: str):
+    """Route to the correct colour array; ensure big_orange doesn't fall through."""
+    a = float(P[0,0]); d = float(P[1,1]); b = float(P[0,1]); c = float(P[1,0])
     pt = ConeWithCovariance()
     pt.point.x = x; pt.point.y = y; pt.point.z = 0.0
-    pt.covariance = [a,b,c,d]
-    color = (color or "").lower()
-    if color.startswith("y"): arr.yellow_cones.append(pt)
-    elif color.startswith("o") and "big" in color: arr.big_orange_cones.append(pt)
-    elif color.startswith("o"): arr.orange_cones.append(pt)
-    else: arr.blue_cones.append(pt)
+    pt.covariance = [a, b, c, d]
 
-# -------- node --------
+    cl = (color or "").lower().strip()
+    if ("big" in cl) and ("orange" in cl):
+        arr.big_orange_cones.append(pt)
+    elif "orange" in cl or cl.startswith("o"):
+        arr.orange_cones.append(pt)
+    elif "yellow" in cl or cl.startswith("y"):
+        arr.yellow_cones.append(pt)
+    else:
+        arr.blue_cones.append(pt)
+
+# ---------- node ----------
 class OnlineMapper(Node):
     def __init__(self):
         super().__init__("fslam_online_mapper", automatically_declare_parameters_from_overrides=True)
 
-        # topics
+        # I/O topics
         self.declare_parameter("topics.pose_in", "/odometry_integration/car_state")
         self.declare_parameter("topics.cones_in", "/ground_truth/cones")
         self.declare_parameter("topics.map_out", "/mapper/known_map")
 
-        # frames & DA
-        self.declare_parameter("detections_frame", "base")    # "base" or "world"
-        self.declare_parameter("da.gate_p", 0.997)            # χ² prob for 2 dof
-        self.declare_parameter("da.crop_radius_m", 28.0)
-        self.declare_parameter("da.use_color", True)          # restrict candidates by colour
-        self.declare_parameter("da.min_separation_m", 1.0)    # if nearest landmark farther than this, prefer new
+        # Frames & DA
+        self.declare_parameter("detections_frame", "base")      # "base" or "world"
+        self.declare_parameter("da.gate_p", 0.99)               # χ² gate (2 dof)
+        self.declare_parameter("da.crop_radius_m", 25.0)
+        self.declare_parameter("da.use_color", True)
+        self.declare_parameter("da.min_separation_m", 0.0)
 
-        # noise handling
-        self.declare_parameter("meas.sigma_floor_xy", 0.25)   # added diag
-        self.declare_parameter("meas.inflate_xy", 0.0)        # extra diag inflation
-        self.declare_parameter("init.landmark_var", 0.20)     # initial var added to Sw for new landmarks
+        # NEW: perception throttle (Hz). 0 => no throttle.
+        self.declare_parameter("da.target_cone_hz", 0.0)
 
-        # publishing & saving
-        self.declare_parameter("publish_hz", 10.0)
-        self.declare_parameter("save.csv_path", "slam_utils/data/online_map.csv")
-        self.declare_parameter("save.every_s", 5.0)
+        # Measurement handling
+        self.declare_parameter("meas.sigma_floor_xy", 0.35)
+        self.declare_parameter("meas.inflate_xy", 0.05)
+        self.declare_parameter("init.landmark_var", 0.30)
 
-        # read params
-        P = self.get_parameter
-        self.pose_topic = str(P("topics.pose_in").value)
-        self.cones_topic = str(P("topics.cones_in").value)
-        self.map_topic  = str(P("topics.map_out").value)
-        self.det_frame  = str(P("detections_frame").value).lower()
+        # Read params
+        gp = self.get_parameter
+        self.pose_topic = str(gp("topics.pose_in").value)
+        self.cones_topic = str(gp("topics.cones_in").value)
+        self.map_topic = str(gp("topics.map_out").value)
+        self.det_frame = str(gp("detections_frame").value).lower()
 
-        self.gate_p     = float(P("da.gate_p").value)
-        self.crop_r2    = float(P("da.crop_radius_m").value)**2
-        self.use_color  = bool(P("da.use_color").value)
-        self.min_sep    = float(P("da.min_separation_m").value)
+        self.gate_p = float(gp("da.gate_p").value)
+        self.crop_r2 = float(gp("da.crop_radius_m").value) ** 2
+        self.use_color = bool(gp("da.use_color").value)
+        self.min_sep = float(gp("da.min_separation_m").value)
+        self.target_cone_hz = float(gp("da.target_cone_hz").value)
 
-        self.sigma_floor = float(P("meas.sigma_floor_xy").value)
-        self.inflate_xy  = float(P("meas.inflate_xy").value)
-        self.init_lm_var = float(P("init.landmark_var").value)
-
-        self.pub_hz     = float(P("publish_hz").value)
-        self.csv_path   = Path(str(P("save.csv_path").value)).resolve()
-        self.save_every = float(P("save.every_s").value)
+        self.sigma_floor = float(gp("meas.sigma_floor_xy").value)
+        self.inflate_xy = float(gp("meas.inflate_xy").value)
+        self.init_lm_var = float(gp("init.landmark_var").value)
 
         self.chi2_gate = chi2_quantile(2, self.gate_p)
 
-        # state: odom buffer for time alignment
+        # State: latest pose; last processed cone timestamp (for throttle)
         self.pose_ready = False
-        self.odom_buf: deque = deque()  # (t, x, y, yaw)
-        self.odom_window = 2.0          # seconds to keep for interpolation
-        self.last_save = time.time()
+        self.x = 0.0; self.y = 0.0; self.yaw = 0.0
+        self._last_cone_ts = None  # seconds (float)
 
-        # landmarks = [{'m': [x,y], 'P': 2x2, 'color': str, 'hits': int, 'last_seen': t}]
+        # Landmarks
         self.landmarks: List[dict] = []
 
         # ROS I/O
-        q_rel = QoSProfile(depth=200, reliability=QoSReliabilityPolicy.RELIABLE,
-                           durability=QoSDurabilityPolicy.VOLATILE, history=QoSHistoryPolicy.KEEP_LAST)
-        q_fast = QoSProfile(depth=200, reliability=QoSReliabilityPolicy.BEST_EFFORT,
-                            durability=QoSDurabilityPolicy.VOLATILE, history=QoSHistoryPolicy.KEEP_LAST)
+        q_rel = QoSProfile(depth=200, reliability=QoSReliabilityPolicy.RELIABLE, history=QoSHistoryPolicy.KEEP_LAST)
+        q_fast = QoSProfile(depth=200, reliability=QoSReliabilityPolicy.BEST_EFFORT, history=QoSHistoryPolicy.KEEP_LAST)
 
         self.create_subscription(Odometry, self.pose_topic, self.cb_pose, q_rel)
         self.create_subscription(ConeArrayWithCovariance, self.cones_topic, self.cb_cones, q_fast)
         self.pub_map = self.create_publisher(ConeArrayWithCovariance, self.map_topic, 10)
 
-        if self.pub_hz > 0.0:
-            self.create_timer(max(0.02, 1.0/self.pub_hz), self._publish_map)
+        self.get_logger().info(
+            f"[mapper] pose_in={self.pose_topic} cones={self.cones_topic} map_out={self.map_topic}")
+        self.get_logger().info(
+            f"[mapper] frame={self.det_frame} | χ²(2,{self.gate_p})={self.chi2_gate:.2f} | crop={math.sqrt(self.crop_r2):.1f}m | "
+            f"colorDA={self.use_color} | target_cone_hz={self.target_cone_hz:.1f}"
+        )
 
-        try:
-            signal.signal(signal.SIGINT, self._on_sig)
-            signal.signal(signal.SIGTERM, self._on_sig)
-        except Exception:
-            pass
-
-        self.get_logger().info(f"[mapper] pose_in={self.pose_topic} cones={self.cones_topic} map_out={self.map_topic}")
-        self.get_logger().info(f"[mapper] frame={self.det_frame} | χ²(2,{self.gate_p})={self.chi2_gate:.3f} | crop={math.sqrt(self.crop_r2):.1f}m | colorDA={self.use_color}")
-
-    # ---- odom feed ----
+    # --- pose feed (latest only) ---
     def cb_pose(self, msg: Odometry):
-        t = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
-        x = float(msg.pose.pose.position.x)
-        y = float(msg.pose.pose.position.y)
         q = msg.pose.pose.orientation
-        yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
-        self.odom_buf.append((t, x, y, yaw))
-        tmin = t - self.odom_window
-        while self.odom_buf and self.odom_buf[0][0] < tmin:
-            self.odom_buf.popleft()
+        self.x = float(msg.pose.pose.position.x)
+        self.y = float(msg.pose.pose.position.y)
+        self.yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
         if not self.pose_ready:
             self.pose_ready = True
             self.get_logger().info("[mapper] predictor pose feed ready.")
 
-    def _pose_at(self, tq: float) -> Tuple[np.ndarray, float]:
-        if not self.odom_buf:
-            return np.array([0.0,0.0,0.0], float), float('inf')
-        ts = [it[0] for it in self.odom_buf]
-        i = bisect.bisect_left(ts, tq)
-        if i == 0:
-            t0,x0,y0,yaw0 = self.odom_buf[0]
-            return np.array([x0,y0,yaw0], float), abs(tq - t0)
-        if i >= len(self.odom_buf):
-            t1,x1,y1,yaw1 = self.odom_buf[-1]
-            return np.array([x1,y1,yaw1], float), abs(tq - t1)
-        t0,x0,y0,yaw0 = self.odom_buf[i-1]
-        t1,x1,y1,yaw1 = self.odom_buf[i]
-        if t1 == t0:
-            return np.array([x0,y0,yaw0], float), abs(tq - t0)
-        a = (tq - t0)/(t1 - t0)
-        x = x0 + a*(x1 - x0)
-        y = y0 + a*(y1 - y0)
-        dyaw = wrap(yaw1 - yaw0)
-        yaw = wrap(yaw0 + a*dyaw)
-        dt_near = min(abs(tq - t0), abs(tq - t1))
-        return np.array([x,y,yaw], float), dt_near
-
-    # ---- cones feed ----
+    # --- cones feed ---
     def cb_cones(self, msg: ConeArrayWithCovariance):
         if not self.pose_ready:
             return
-        tz = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
-        pose_w_b, dt_pose = self._pose_at(tz)
-        xw, yw, yaw = pose_w_b
-        Rwb = rot2d(yaw); pos = np.array([xw, yw], float)
 
-        detections = []  # (pw, Sw, color)
-        def add_arr(arr, color_hint: str):
+        tz = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
+
+        # Throttle: process at ~target_cone_hz (0 = no throttle)
+        if self.target_cone_hz > 0.0 and self._last_cone_ts is not None:
+            min_dt = 1.0 / max(1e-6, self.target_cone_hz)
+            if (tz - self._last_cone_ts) < min_dt:
+                return
+        self._last_cone_ts = tz
+
+        Rwb = rot2d(self.yaw); pos = np.array([self.x, self.y], float)
+
+        # Build detection list in WORLD
+        dets = []  # (pw, Sw, color)
+        def add(arr, color_hint):
             for c in arr:
                 px = float(c.point.x); py = float(c.point.y)
                 Pw = np.array([[c.covariance[0], c.covariance[1]],
                                [c.covariance[2], c.covariance[3]]], float)
-                # meas floor + optional inflation
-                Pw = Pw + np.diag([self.sigma_floor**2, self.sigma_floor**2])
-                if self.inflate_xy > 0.0:
-                    Pw = Pw + np.eye(2)*self.inflate_xy
+                Pw = Pw + np.diag([self.sigma_floor**2, self.sigma_floor**2]) + np.eye(2)*self.inflate_xy
                 if self.det_frame == "base":
-                    pb = np.array([px,py], float)
+                    pb = np.array([px, py], float)
                     pw = pos + (Rwb @ pb)
                     Sw = Rwb @ Pw @ Rwb.T
                 else:
-                    pw = np.array([px,py], float)
+                    pw = np.array([px, py], float)
                     Sw = Pw
-                detections.append((pw, Sw, color_hint))
+                dets.append((pw, Sw, color_hint))
 
-        add_arr(msg.blue_cones, "blue")
-        add_arr(msg.yellow_cones, "yellow")
-        add_arr(msg.orange_cones, "orange")
-        add_arr(msg.big_orange_cones, "big_orange")
+        add(msg.blue_cones, "blue")
+        add(msg.yellow_cones, "yellow")
+        add(msg.orange_cones, "orange")
+        add(msg.big_orange_cones, "big_orange")
 
-        if not detections:
+        if not dets:
             return
 
-        # Prepare landmark matrix for quick distance crop
         LM = np.array([lm['m'] for lm in self.landmarks], float) if self.landmarks else np.zeros((0,2), float)
 
         upd = 0; new = 0
-        for (pw, Sw, col) in detections:
-            match_idx = -1
+        for (pw, Sw, col) in dets:
+            match = -1
             best_m2 = 1e18
             nearest_euclid2 = 1e18
 
@@ -233,14 +213,10 @@ class OnlineMapper(Node):
                 diffs = LM - pw[None,:]
                 d2 = np.einsum('ij,ij->i', diffs, diffs)
                 near = np.where(d2 <= self.crop_r2)[0]
-
-                # colour filter (optional)
                 if self.use_color:
-                    near = np.array([j for j in near if self._colors_compatible(self.landmarks[j]['color'], col)], dtype=int)
-
+                    near = np.array([j for j in near if self._color_ok(self.landmarks[j]['color'], col)], dtype=int)
                 if near.size > 0:
                     nearest_euclid2 = float(np.min(d2[near]))
-                    # proper gate with S = P + Sw
                     for j in near:
                         P = self.landmarks[j]['P']
                         S = P + Sw
@@ -249,28 +225,19 @@ class OnlineMapper(Node):
                         innov = pw - self.landmarks[j]['m']
                         m2 = float(innov.T @ S_inv @ innov)
                         if m2 < best_m2 and m2 <= self.chi2_gate:
-                            best_m2 = m2; match_idx = int(j)
+                            best_m2 = m2; match = int(j)
 
-            # create vs update decision
-            create = (match_idx < 0)
-            if not create and self.min_sep > 0.0:
-                # if it's unusually far, prefer a new landmark (prevents fusing distant cones)
-                if nearest_euclid2 > (self.min_sep**2):
-                    create = True
+            create = (match < 0)
+            if not create and self.min_sep > 0.0 and nearest_euclid2 > (self.min_sep**2):
+                create = True
 
             if create:
-                P0 = Sw + np.eye(2)*(self.init_lm_var)
-                self.landmarks.append({
-                    'm': pw.copy(),
-                    'P': P0,
-                    'color': col,
-                    'hits': 1,
-                    'last_seen': tz
-                })
+                P0 = Sw + np.eye(2)*self.init_lm_var
+                self.landmarks.append({'m': pw.copy(), 'P': P0, 'color': col, 'hits': 1, 'last_seen': tz})
                 new += 1
                 LM = np.vstack([LM, pw[None,:]]) if LM.size else pw.reshape(1,2)
             else:
-                lm = self.landmarks[match_idx]
+                lm = self.landmarks[match]
                 m = lm['m']; P = lm['P']
                 S = P + Sw
                 try: S_inv = np.linalg.inv(S)
@@ -284,64 +251,28 @@ class OnlineMapper(Node):
                 lm['hits'] += 1
                 lm['last_seen'] = tz
                 upd += 1
-                LM[match_idx,:] = m_new  # keep cache consistent
+                LM[match,:] = m_new
 
-        if (upd + new) > 0:
-            self.get_logger().info(f"[mapper] t={tz:7.2f}s det={len(detections)} upd={upd} new={new} LM={len(self.landmarks)} dt_pose={dt_pose*1e3:.1f}ms")
+        # Publish immediately (no timers, no files)
+        out = ConeArrayWithCovariance()
+        out.header.stamp = self.get_clock().now().to_msg()
+        out.header.frame_id = "map"
+        for lm in self.landmarks:
+            add_cone(out, float(lm['m'][0]), float(lm['m'][1]), lm['P'], lm['color'])
+        self.pub_map.publish(out)
 
-        now = time.time()
-        if (now - self.last_save) >= self.save_every:
-            self._save_csv()
-            self.last_save = now
+        self.get_logger().info(
+            f"[mapper] t={tz:7.2f}s det={len(dets)} upd={upd} new={new} LM={len(self.landmarks)}"
+            + (f" | throttled to ~{self.target_cone_hz:.1f} Hz" if self.target_cone_hz > 0.0 else "")
+        )
 
-    def _colors_compatible(self, lm_color: str, obs_color: str) -> bool:
-        if not lm_color or not obs_color: return True
-        # strict equality except allow "big_orange" with "orange"
-        if lm_color == obs_color: return True
-        if ("orange" in lm_color) and ("orange" in obs_color): return True
+    def _color_ok(self, lm_c: str, obs_c: str) -> bool:
+        if not lm_c or not obs_c: return True
+        if lm_c == obs_c: return True
+        if ("orange" in lm_c) and ("orange" in obs_c): return True
         return False
 
-    # ---- publish/save ----
-    def _publish_map(self):
-        if not self.landmarks:
-            return
-        msg = ConeArrayWithCovariance()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "map"
-        for lm in self.landmarks:
-            cone_array_append(msg, float(lm['m'][0]), float(lm['m'][1]), lm['P'], lm['color'])
-        self.pub_map.publish(msg)
-
-    def _save_csv(self):
-        try:
-            self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.csv_path.with_suffix(".csv.tmp")
-            with open(tmp, "w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["x","y","color","var_x","var_y","cov_xy","hits","last_seen_s"])
-                for lm in self.landmarks:
-                    P = lm['P']
-                    w.writerow([
-                        f"{lm['m'][0]:.6f}",
-                        f"{lm['m'][1]:.6f}",
-                        lm['color'],
-                        f"{P[0,0]:.6f}",
-                        f"{P[1,1]:.6f}",
-                        f"{P[0,1]:.6f}",
-                        lm['hits'],
-                        f"{lm['last_seen']:.3f}"
-                    ])
-            os.replace(tmp, self.csv_path)
-            self.get_logger().info(f"[mapper] map saved: {self.csv_path} ({len(self.landmarks)} landmarks)")
-        except Exception as e:
-            self.get_logger().warn(f"[mapper] save failed: {e}")
-
-    def _on_sig(self, *_):
-        self.get_logger().info("[mapper] signal caught, saving map...")
-        try: self._save_csv()
-        finally: rclpy.shutdown()
-
-# ---- main ----
+# ---------- main ----------
 def main():
     rclpy.init()
     node = OnlineMapper()
@@ -351,7 +282,6 @@ def main():
         pass
     finally:
         if rclpy.ok():
-            node._save_csv()
             rclpy.shutdown()
 
 if __name__ == "__main__":

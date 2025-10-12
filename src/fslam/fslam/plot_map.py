@@ -106,7 +106,7 @@ def main():
 
     # Matplotlib setup
     fig, ax = plt.subplots(figsize=(7,7))
-    ax.set_title('Live Cone Map (/mapper/known_map)')
+    ax.set_title('Cone Map')
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     ax.set_aspect('equal', adjustable='box')
