@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# live_plot_node.py (PF-corrected vs GT; optional EKF)
+# fslam_view.py (PF-corrected vs GT; optional EKF)
 #
 # Subscribes to:
 #   - Corrected (PF): /pf_localizer/odom_corrected  (Odometry)

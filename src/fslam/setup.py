@@ -20,9 +20,14 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'fslam_node = fslam.fslam_node:main',
+            'fslam_jcbb = fslam.fslam_node_jcbb:main',
+            'fslam_ijcbb = fslam.fslam_node_ijcbb:main',
+            'fslam_icp = fslam.fslam_node_icp:main',
+            'fslam_hung = fslam.fslam_node_hung:main',
             'plot = fslam.fslam_view:main',
             'fslam_pred = fslam.fslam_pred:main',
+            'map = fslam.mapper:main',
+            'map_plot = fslam.plot_map:main'
         ],
     },
 )

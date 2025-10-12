@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# pf_da_corrector.py
+# fslam_node.py
 #
 # Post-filter node:
 #   - Subscribes to predicted odom (your IMU+wheel node)

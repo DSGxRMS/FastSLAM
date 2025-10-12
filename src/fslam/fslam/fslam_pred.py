@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# imu_wheel_ekf_node.py
+# fslam_pred.py
 #
 # Runs indefinitely:
 #  - Predicts from IMU continuously
@@ -67,11 +67,11 @@ class ImuWheelEKF(Node):
         self.declare_parameter("topics.out_odom", "/odometry_integration/car_state")
         self.declare_parameter("topics.out_pose2d", "/odometry_integration/pose2d")
 
-        self.declare_parameter("run.bias_window_s", 5.0)
+        self.declare_parameter("run.bias_window_s", 1.0)
         self.declare_parameter("log.cli_hz", 1.0)
 
         self.declare_parameter("input.imu_use_rate_hz", 0.0)
-        self.declare_parameter("input.target_wheel_hz", 400.0)
+        self.declare_parameter("input.target_wheel_hz", 800.0)
 
         # Keep defaults at 0.0 so prediction matches your predictor exactly.
         self.declare_parameter("proc.sigma_acc", 0.0)
