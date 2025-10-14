@@ -21,7 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'path = pathp.delaunay:main',
-            'path_plot = pathp.path_plot:main'
+            'path_plot = pathp.path_plot_temp:main'
         ],
     },
 )

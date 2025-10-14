@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # fslam_delaunay_live.py
 #
-# Live Delaunay with color constraints + BY-only midpoints + NN path.
-# One-side fallback: synthesize the missing side and PLOT synthesized points
-# as blue X (synth blue) or yellow X (synth yellow).
+# Live Delaunay with color constraints + pink midpoint X's +
+# CYAN NN path from (0,0) that stops when a new segment would self-intersect.
 
 import threading
 import numpy as np
@@ -36,12 +35,6 @@ class DelaunayLive(Node):
         self.declare_parameter('point_size', 18.0)
         self.declare_parameter('max_points', 0)
 
-        # Fallback synthesis offset (distance). Rule:
-        # - Only Yellow present  -> Blue = Yellow + (-dx, -dy)
-        # - Only Blue   present  -> Yellow = Blue + (+dx, +dy)
-        self.declare_parameter('synth_dx_m', -3.0)
-        self.declare_parameter('synth_dy_m', -3.0)
-
         gp = self.get_parameter
         self.cones_topic  = str(gp('cones_topic').value)
         self.refresh_hz   = float(gp('refresh_hz').value)
@@ -49,9 +42,6 @@ class DelaunayLive(Node):
         self.limit_margin = float(gp('limit_margin_m').value)
         self.pt_size      = float(gp('point_size').value)
         self.max_points   = int(gp('max_points').value)
-
-        self.synth_dx = float(gp('synth_dx_m').value)
-        self.synth_dy = float(gp('synth_dy_m').value)
 
         q = QoSProfile(depth=100, reliability=QoSReliabilityPolicy.BEST_EFFORT,
                        history=QoSHistoryPolicy.KEEP_LAST)
@@ -142,19 +132,26 @@ def _spin_thread(node: DelaunayLive):
 
 # --------- geometry helpers for non-self-intersecting path ---------
 def _orient(a, b, c):
+    # cross((b-a),(c-a))
     return (b[0]-a[0])*(c[1]-a[1]) - (b[1]-a[1])*(c[0]-a[0])
 
 def _on_seg(a, b, c, eps=1e-9):
+    # c on segment ab?
     return (min(a[0], b[0]) - eps <= c[0] <= max(a[0], b[0]) + eps and
             min(a[1], b[1]) - eps <= c[1] <= max(a[1], b[1]) + eps)
 
 def segments_intersect(p1, p2, q1, q2, eps=1e-9):
+    # Proper segment intersection with collinearity handling
     o1 = _orient(p1, p2, q1)
     o2 = _orient(p1, p2, q2)
     o3 = _orient(q1, q2, p1)
     o4 = _orient(q1, q2, p2)
+
+    # General case
     if (o1*o2 < -eps) and (o3*o4 < -eps):
         return True
+
+    # Collinear cases
     if abs(o1) <= eps and _on_seg(p1, p2, q1): return True
     if abs(o2) <= eps and _on_seg(p1, p2, q2): return True
     if abs(o3) <= eps and _on_seg(q1, q2, p1): return True
@@ -162,33 +159,49 @@ def segments_intersect(p1, p2, q1, q2, eps=1e-9):
     return False
 
 def greedy_nn_path_no_self_intersections(start: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """
+    Greedy NN chain from 'start', stopping immediately if the next segment would
+    intersect any already-built segment. Returns Kx2 array, including 'start'.
+    """
     if pts.size == 0:
         return start.reshape(1,2)
+
     used = np.zeros(pts.shape[0], dtype=bool)
     path = [start.copy()]
     cur = start.copy()
+
     while True:
         idxs = np.where(~used)[0]
         if idxs.size == 0:
             break
+
+        # Pick nearest remaining
         dif = pts[idxs] - cur[None,:]
         d2  = np.einsum('ij,ij->i', dif, dif)
         k   = idxs[int(np.argmin(d2))]
         nxt = pts[k]
+
+        # Check intersection of (cur -> nxt) with any previous segment (path[i-1] -> path[i])
         intersect = False
         if len(path) >= 2:
             for i in range(1, len(path)):
                 a, b = path[i-1], path[i]
+                # Skip adjacency (sharing endpoint)
                 if (np.allclose(a, cur) or np.allclose(b, cur)):
                     continue
                 if segments_intersect(a, b, cur, nxt):
                     intersect = True
                     break
+
         if intersect:
+            # Cut off the path as soon as a crossing would occur
             break
+
+        # Accept this point
         path.append(nxt.copy())
         used[k] = True
         cur = nxt
+
     return np.stack(path, axis=0)
 
 
@@ -197,33 +210,27 @@ def main():
     node = DelaunayLive()
 
     fig, ax = plt.subplots(figsize=(8, 8))
-    ax.set_title("Cones + Constrained Delaunay + BY Midpoints + NN Path (with one-side fallback)")
+    ax.set_title("Cones + Constrained Delaunay + Midpoints + NN Non-Intersecting Path")
     ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
     ax.set_aspect('equal', adjustable='box')
     ax.grid(True, linestyle=':', linewidth=0.6)
 
     s = node.pt_size
-    scat_blue    = ax.scatter([], [], s=s, c='b', marker='o', label='Blue')
-    scat_yellow  = ax.scatter([], [], s=s, c='y', marker='o', edgecolors='k', linewidths=0.4, label='Yellow')
-    scat_orange  = ax.scatter([], [], s=s, c='orange', marker='o', label='Orange')
-    scat_big     = ax.scatter([], [], s=s*1.3, c='r', marker='s', label='Big Orange')
-
-    # Synthesized point markers (X)
-    scat_blue_syn   = ax.scatter([], [], s=s*0.9, c='b', marker='x', linewidths=1.8, label='Synth Blue')
-    scat_yellow_syn = ax.scatter([], [], s=s*0.9, c='y', marker='x', linewidths=1.8, label='Synth Yellow')
+    scat_blue   = ax.scatter([], [], s=s, c='b', marker='o', label='Blue')
+    scat_yellow = ax.scatter([], [], s=s, c='y', marker='o', edgecolors='k', linewidths=0.4, label='Yellow')
+    scat_orange = ax.scatter([], [], s=s, c='orange', marker='o', label='Orange')
+    scat_big    = ax.scatter([], [], s=s*1.3, c='r', marker='s', label='Big Orange')
 
     lc_by = LineCollection([], linewidths=1.8, colors='k', alpha=0.75, label='Blue↔Yellow')
     lc_or = LineCollection([], linewidths=1.8, colors='r', alpha=0.65, label='Orange-family')
     ax.add_collection(lc_by)
     ax.add_collection(lc_or)
 
-    # Pink X midpoints (BY only) + fixed origin
-    scat_mid = ax.scatter([], [], s=s*0.9, c='#ff2fa6', marker='x', linewidths=1.8,
-                          label='Midpoints (BY) + (0,0)')
+    # Pink X midpoints (including fixed origin)
+    scat_mid = ax.scatter([], [], s=s*0.9, c='#ff2fa6', marker='x', linewidths=1.8, label='Midpoints + (0,0)')
 
-    # Cyan path through BY midpoints (nearest-neighbor from origin, non self-intersecting)
-    path_line, = ax.plot([], [], '-', color='c', linewidth=2.0, alpha=0.9,
-                         label='NN non-intersecting path')
+    # Cyan path through midpoints (nearest-neighbor from origin, non self-intersecting)
+    path_line, = ax.plot([], [], '-', color='c', linewidth=2.0, alpha=0.9, label='NN non-intersecting path')
 
     ax.legend(loc='upper right')
 
@@ -240,24 +247,11 @@ def main():
         set_offsets(scat_orange, O)
         set_offsets(scat_big,    G)
 
-        # One-side fallback synthesis (for triangulation/path) + plotted X markers
-        B_eff, Y_eff = B, Y
-        B_syn = np.zeros((0,2)); Y_syn = np.zeros((0,2))
-        if B.shape[0] == 0 and Y.shape[0] > 0:
-            B_syn = Y + np.array([-node.synth_dx, -node.synth_dy])[None, :]
-            B_eff = B_syn
-        elif Y.shape[0] == 0 and B.shape[0] > 0:
-            Y_syn = B + np.array([ node.synth_dx,  node.synth_dy])[None, :]
-            Y_eff = Y_syn
-
-        set_offsets(scat_blue_syn,   B_syn)
-        set_offsets(scat_yellow_syn, Y_syn)
-
         parts, labls = [], []
-        if B_eff.size: parts.append(B_eff); labls.append(np.full(B_eff.shape[0], LBL_BLUE,   int))
-        if Y_eff.size: parts.append(Y_eff); labls.append(np.full(Y_eff.shape[0], LBL_YELLOW, int))
-        if O.size:     parts.append(O);     labls.append(np.full(O.shape[0],     LBL_ORANGE, int))
-        if G.size:     parts.append(G);     labls.append(np.full(G.shape[0],     LBL_BIG,    int))
+        if B.size: parts.append(B); labls.append(np.full(B.shape[0], LBL_BLUE,   int))
+        if Y.size: parts.append(Y); labls.append(np.full(Y.shape[0], LBL_YELLOW, int))
+        if O.size: parts.append(O); labls.append(np.full(O.shape[0], LBL_ORANGE, int))
+        if G.size: parts.append(G); labls.append(np.full(G.shape[0], LBL_BIG,    int))
 
         mids = None
         if parts:
@@ -267,9 +261,13 @@ def main():
             lc_by.set_segments(S_by)
             lc_or.set_segments(S_or)
 
-            # Midpoints ONLY from Blue↔Yellow segments
+            mids_list = []
             if S_by.shape[0]:
-                mids = S_by.mean(axis=1)
+                mids_list.append(S_by.mean(axis=1))
+            if S_or.shape[0]:
+                mids_list.append(S_or.mean(axis=1))
+            if mids_list:
+                mids = np.vstack(mids_list)
         else:
             lc_by.set_segments([])
             lc_or.set_segments([])
@@ -281,7 +279,7 @@ def main():
             M = np.vstack([mids, origin])
         set_offsets(scat_mid, M)
 
-        # NN non-self-intersecting path from origin through BY midpoints
+        # NN non-self-intersecting path from origin through midpoints
         if M.shape[0] >= 2:
             is_origin = np.isclose(M[:,0], 0.0) & np.isclose(M[:,1], 0.0)
             Pm = M[~is_origin]
@@ -292,7 +290,7 @@ def main():
 
         if node.auto_limits:
             pts = []
-            for arr in (B, Y, O, G, M, B_syn, Y_syn):
+            for arr in (B, Y, O, G, M):
                 if arr.size: pts.append(arr)
             if lc_by.get_segments():
                 pts.append(np.vstack(lc_by.get_segments()).reshape(-1,2))
@@ -311,9 +309,7 @@ def main():
                 ax.set_xlim(xmin - m, xmax + m)
                 ax.set_ylim(ymin - m, ymax + m)
 
-        return (scat_blue, scat_yellow, scat_orange, scat_big,
-                scat_blue_syn, scat_yellow_syn,
-                lc_by, lc_or, scat_mid, path_line)
+        return (scat_blue, scat_yellow, scat_orange, scat_big, lc_by, lc_or, scat_mid, path_line)
 
     interval_ms = max(20, int(1000.0 / max(1e-3, node.refresh_hz)))
     ani = FuncAnimation(fig, update, interval=interval_ms, blit=False)
