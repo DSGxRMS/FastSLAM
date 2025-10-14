@@ -161,7 +161,7 @@ class ImuOnlyPredictor(Node):
 
         self.get_logger().info(
             f"[IMU-PRED] imu={self.topic_imu} | out={self.topic_out}\n"
-            f"           bias_window={self.bias_window_s}s | IMU-only (no wheel fusion)"
+            f"           bias_window={self.bias_window_s}s | "
         )
 
     # ---------- Callbacks ----------

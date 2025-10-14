@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-# fslam_mapper.py — minimal online cone mapper + light loop-closure (big_orange gate)
+# fslam_mapper_jcbb.py — Online cone mapping with JCBB + tiny PF drift correction (Δ = [dx, dy, dθ])
 #
-# Subscribes:
-#   - /odometry_integration/car_state (nav_msgs/Odometry)
-#   - /ground_truth/cones (eufs_msgs/ConeArrayWithCovariance)
+# Input:
+#   /odometry_integration/car_state         (nav_msgs/Odometry)
+#   /ground_truth/cones                     (eufs_msgs/ConeArrayWithCovariance)
 #
-# Publishes:
-#   - /mapper/known_map (eufs_msgs/ConeArrayWithCovariance)
+# Output:
+#   /mapper/known_map                       (eufs_msgs/ConeArrayWithCovariance)
 #
-# Loop-closure will ONLY trigger if:
-#   - car is physically back near the start gate (pos within loop.close_radius_m),
-#   - car is effectively stopped (|v| <= loop.stop_speed_mps),
-#   - a big_orange pair near the anchor centroid is seen,
-#   - the observed gate width matches the anchor width within loop.sep_tol_m.
+# Notes:
+#   - JCBB runs against the **current map** (no ICP, no pose graph).
+#   - Gates use S_gate = P_lm + inflate(S_meas, α,β, …)  (CRITICAL FIX).
+#   - A tiny PF estimates Δ each frame to cancel odom drift; Δ is applied before gating & fusion.
+#   - Throughput: caps on candidates/obs + DFS time budget; throttling supported.
 
-import math
-from typing import List, Optional, Tuple
+import math, time, bisect
+from collections import deque
+from typing import List, Tuple
+
 import numpy as np
-
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
@@ -81,7 +82,7 @@ def add_cone(arr: ConeArrayWithCovariance, x: float, y: float, P: np.ndarray, co
         arr.blue_cones.append(pt)
 
 # ---------- node ----------
-class OnlineMapper(Node):
+class JCBBMapper(Node):
     def __init__(self):
         super().__init__("fslam_online_mapper", automatically_declare_parameters_from_overrides=True)
 
@@ -92,29 +93,36 @@ class OnlineMapper(Node):
 
         # Frames & DA
         self.declare_parameter("detections_frame", "base")
-        self.declare_parameter("da.gate_p", 0.99)               # χ² gate (2 dof)
-        self.declare_parameter("da.crop_radius_m", 25.0)
-        self.declare_parameter("da.use_color", True)
-        self.declare_parameter("da.min_separation_m", 0.0)
+        self.declare_parameter("map_crop_m", 30.0)
+        self.declare_parameter("chi2_gate_2d", 13.28)     # ~99% for 2 dof
+        self.declare_parameter("joint_sig", 0.99)
+        self.declare_parameter("joint_relax", 1.25)
+        self.declare_parameter("min_k_for_joint", 3)
 
-        # Perception throttle (Hz). 0 => no throttle.
-        self.declare_parameter("da.target_cone_hz", 0.0)
-
-        # Measurement handling
+        # Meas & inflation (like your PF node)
         self.declare_parameter("meas.sigma_floor_xy", 0.35)
-        self.declare_parameter("meas.inflate_xy", 0.05)
-        self.declare_parameter("init.landmark_var", 0.30)
+        self.declare_parameter("alpha_trans", 0.9)
+        self.declare_parameter("beta_rot", 0.9)
 
-        # --- Loop-closure (simple gate-based) ---
-        self.declare_parameter("loop.enable", True)
-        self.declare_parameter("loop.min_gate_sep_m", 2.0)
-        self.declare_parameter("loop.max_gate_sep_m", 8.0)
-        self.declare_parameter("loop.close_radius_m", 10.0)     # car & gate centroid must be within this
-        self.declare_parameter("loop.sep_tol_m", 0.6)
-        self.declare_parameter("loop.min_lm_before_close", 30)
-        self.declare_parameter("loop.cooldown_s", 5.0)
-        self.declare_parameter("loop.require_stop", True)        # NEW: require near-zero speed
-        self.declare_parameter("loop.stop_speed_mps", 0.5)       # NEW: ≤ 0.5 m/s counts as “stopped”
+        # Landmark handling
+        self.declare_parameter("init.landmark_var", 0.30)
+        self.declare_parameter("meas.inflate_xy", 0.05)
+        self.declare_parameter("da.min_separation_m", 0.0)
+        self.declare_parameter("stale.seen_slowdown_s", 2.0)
+        self.declare_parameter("stale.inflation_mul", 1.5)
+
+        # Throughput
+        self.declare_parameter("da.target_cone_hz", 0.0)
+        self.declare_parameter("da.max_cands_per_obs", 4)
+        self.declare_parameter("da.max_obs_for_jcbb", 16)
+        self.declare_parameter("da.time_budget_ms", 10.0)
+
+        # Tiny PF over Δ
+        self.declare_parameter("pf.num_particles", 200)
+        self.declare_parameter("pf.resample_neff_ratio", 0.5)
+        self.declare_parameter("pf.process_std_xy_m", 0.02)
+        self.declare_parameter("pf.process_std_yaw_rad", 0.002)
+        self.declare_parameter("pf.likelihood_floor", 1e-12)
 
         # Read params
         gp = self.get_parameter
@@ -123,48 +131,52 @@ class OnlineMapper(Node):
         self.map_topic = str(gp("topics.map_out").value)
         self.det_frame = str(gp("detections_frame").value).lower()
 
-        self.gate_p = float(gp("da.gate_p").value)
-        self.crop_r2 = float(gp("da.crop_radius_m").value) ** 2
-        self.use_color = bool(gp("da.use_color").value)
-        self.min_sep = float(gp("da.min_separation_m").value)
-        self.target_cone_hz = float(gp("da.target_cone_hz").value)
+        self.map_crop_m = float(gp("map_crop_m").value); self.crop2 = self.map_crop_m**2
+        self.chi2_gate = float(gp("chi2_gate_2d").value)
+        self.joint_sig = float(gp("joint_sig").value)
+        self.joint_relax = float(gp("joint_relax").value)
+        self.min_k_for_joint = int(gp("min_k_for_joint").value)
 
         self.sigma_floor = float(gp("meas.sigma_floor_xy").value)
-        self.inflate_xy = float(gp("meas.inflate_xy").value)
+        self.alpha = float(gp("alpha_trans").value)
+        self.beta = float(gp("beta_rot").value)
         self.init_lm_var = float(gp("init.landmark_var").value)
+        self.inflate_xy = float(gp("meas.inflate_xy").value)
+        self.min_sep = float(gp("da.min_separation_m").value)
+        self.stale_T = float(gp("stale.seen_slowdown_s").value)
+        self.stale_mul = float(gp("stale.inflation_mul").value)
 
-        self.loop_enable = bool(gp("loop.enable").value)
-        self.loop_min_sep = float(gp("loop.min_gate_sep_m").value)
-        self.loop_max_sep = float(gp("loop.max_gate_sep_m").value)
-        self.loop_close_r = float(gp("loop.close_radius_m").value)
-        self.loop_sep_tol = float(gp("loop.sep_tol_m").value)
-        self.loop_min_lm = int(gp("loop.min_lm_before_close").value)
-        self.loop_cooldown = float(gp("loop.cooldown_s").value)
-        self.loop_require_stop = bool(gp("loop.require_stop").value)
-        self.loop_stop_speed = float(gp("loop.stop_speed_mps").value)
+        self.target_cone_hz = float(gp("da.target_cone_hz").value)
+        self.max_cands_per_obs = int(gp("da.max_cands_per_obs").value)
+        self.max_obs_for_jcbb = int(gp("da.max_obs_for_jcbb").value)
+        self.time_budget_ms = float(gp("da.time_budget_ms").value)
 
-        self.chi2_gate = chi2_quantile(2, self.gate_p)
+        # PF params
+        self.Np = int(gp("pf.num_particles").value)
+        self.neff_ratio = float(gp("pf.resample_neff_ratio").value)
+        self.p_std_xy = float(gp("pf.process_std_xy_m").value)
+        self.p_std_yaw = float(gp("pf.process_std_yaw_rad").value)
+        self.like_floor = float(gp("pf.likelihood_floor").value)
 
         # State
         self.pose_ready = False
-        self.x = 0.0; self.y = 0.0; self.yaw = 0.0
-        self.speed = 0.0  # NEW: from odom twist
+        self.odom_buf: deque = deque()  # (t,x,y,yaw,v,yr)
+        self.pose_latest = np.array([0.0,0.0,0.0], float)
+        self.odom_buffer_sec = 2.0
+        self.extrap_cap = 0.06
+
         self._last_cone_ts = None
+        self.landmarks: List[dict] = []  # dict(m, P, color, hits, last_seen)
 
-        # Landmarks
-        self.landmarks: List[dict] = []
-
-        # Loop-closure state
-        self.anchor_gate: Optional[Tuple[np.ndarray,np.ndarray]] = None   # (p1, p2)
-        self.anchor_sep: Optional[float] = None
-        self.anchor_centroid: Optional[np.ndarray] = None
-        self.loop_frozen = False
-        self._last_loop_event_ts = -1e9
+        # PF state (Δ)
+        self.particles = np.zeros((self.Np, 3), float)     # [dx, dy, dθ]
+        self.weights = np.ones(self.Np, float)/self.Np
+        self.delta_hat = np.zeros(3, float)
+        self.have_delta = False
 
         # ROS I/O
         q_rel = QoSProfile(depth=200, reliability=QoSReliabilityPolicy.RELIABLE, history=QoSHistoryPolicy.KEEP_LAST)
         q_fast = QoSProfile(depth=200, reliability=QoSReliabilityPolicy.BEST_EFFORT, history=QoSHistoryPolicy.KEEP_LAST)
-
         self.create_subscription(Odometry, self.pose_topic, self.cb_pose, q_rel)
         self.create_subscription(ConeArrayWithCovariance, self.cones_topic, self.cb_cones, q_fast)
         self.pub_map = self.create_publisher(ConeArrayWithCovariance, self.map_topic, 10)
@@ -172,50 +184,150 @@ class OnlineMapper(Node):
         self.get_logger().info(
             f"[mapper] pose_in={self.pose_topic} cones={self.cones_topic} map_out={self.map_topic}")
         self.get_logger().info(
-            f"[mapper] frame={self.det_frame} | χ²(2,{self.gate_p})={self.chi2_gate:.2f} | crop={math.sqrt(self.crop_r2):.1f}m | "
-            f"colorDA={self.use_color} | target_cone_hz={self.target_cone_hz:.1f} | loop_enable={self.loop_enable}"
+            f"[mapper] frame={self.det_frame} | χ²(2)={self.chi2_gate:.2f} | crop={self.map_crop_m:.1f} m | "
+            f"α={self.alpha:.2f} β={self.beta:.2f} | JCBB caps: K={self.max_cands_per_obs}, M={self.max_obs_for_jcbb}, budget={self.time_budget_ms:.1f}ms | PF N={self.Np}"
         )
 
-    # --- pose feed (latest only) ---
+    # ---------- pose feed ----------
     def cb_pose(self, msg: Odometry):
+        t = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        x = float(msg.pose.pose.position.x)
+        y = float(msg.pose.pose.position.y)
         q = msg.pose.pose.orientation
-        self.x = float(msg.pose.pose.position.x)
-        self.y = float(msg.pose.pose.position.y)
-        self.yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
-        # speed from twist (m/s)
+        yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
         vx = float(msg.twist.twist.linear.x) if msg.twist and msg.twist.twist else 0.0
         vy = float(msg.twist.twist.linear.y) if msg.twist and msg.twist.twist else 0.0
-        self.speed = math.hypot(vx, vy)
+        v = math.hypot(vx, vy)
+        yr = float(msg.twist.twist.angular.z) if msg.twist and msg.twist.twist else 0.0
+        self.pose_latest = np.array([x, y, yaw], float)
+        self.odom_buf.append((t, x, y, yaw, v, yr))
+        tmin = t - self.odom_buffer_sec
+        while self.odom_buf and self.odom_buf[0][0] < tmin:
+            self.odom_buf.popleft()
         if not self.pose_ready:
             self.pose_ready = True
             self.get_logger().info("[mapper] predictor pose feed ready.")
 
-    # --- cones feed ---
+    def _pose_at(self, t_query: float):
+        if not self.odom_buf:
+            return self.pose_latest.copy(), float('inf'), 0.0, 0.0
+        times = [it[0] for it in self.odom_buf]
+        idx = bisect.bisect_left(times, t_query)
+        if idx == 0:
+            t0,x0,y0,yaw0,v0,yr0 = self.odom_buf[0]
+            return np.array([x0,y0,yaw0], float), abs(t_query - t0), v0, yr0
+        if idx >= len(self.odom_buf):
+            t1,x1,y1,yaw1,v1,yr1 = self.odom_buf[-1]
+            dt = t_query - t1
+            dt_c = max(0.0, min(dt, self.extrap_cap))
+            if abs(yr1) < 1e-3:
+                x = x1 + v1*dt_c*math.cos(yaw1); y = y1 + v1*dt_c*math.sin(yaw1); yaw = wrap(yaw1)
+            else:
+                x = x1 + (v1/yr1)*(math.sin(yaw1+yr1*dt_c)-math.sin(yaw1))
+                y = y1 - (v1/yr1)*(math.cos(yaw1+yr1*dt_c)-math.cos(yaw1))
+                yaw = wrap(yaw1 + yr1*dt_c)
+            return np.array([x,y,yaw], float), abs(dt), v1, yr1
+        t0,x0,yaw0_x,yaw0_y,yaw0_v,yaw0_yr = self.odom_buf[idx-1]
+        t1,x1,y1,yaw1,v1,yr1 = self.odom_buf[idx]
+        if t1 == t0:
+            return np.array([x1,y1,yaw1], float), abs(t_query - t1), v1, yr1
+        x0_,y0_,yaw0,v0,yr0 = self.odom_buf[idx-1][1:6]
+        a = (t_query - t0)/(t1 - t0)
+        x = x0_ + a*(x1-x0_); y = y0_ + a*(y1-y0_)
+        yaw = wrap(yaw0 + a*wrap(yaw1 - yaw0))
+        v = (1-a)*v0 + a*v1; yr = (1-a)*yr0 + a*yr1
+        dt_near = min(abs(t_query - t0), abs(t_query - t1))
+        return np.array([x,y,yaw], float), dt_near, v, yr
+
+    # ---------- PF over Δ ----------
+    def _pf_predict(self):
+        self.particles[:, 0] += np.random.normal(0.0, self.p_std_xy, size=self.Np)
+        self.particles[:, 1] += np.random.normal(0.0, self.p_std_xy, size=self.Np)
+        self.particles[:, 2] += np.random.normal(0.0, self.p_std_yaw, size=self.Np)
+        self.particles[:, 2] = np.array([wrap(th) for th in self.particles[:, 2]])
+
+    def _pf_update(self, pairs, odom_pose, PB, LM_xy):
+        # Require at least 2 matches for a stable Δ
+        if len(pairs) < 2:
+            return False
+        idxs = [oi for (oi, _, _) in pairs]
+        mids = [mj for (_, mj, _) in pairs]
+        PB_sel = np.stack([PB[i] for i in idxs], axis=0)     # Kx2 body detections
+        MW = LM_xy[np.array(mids, int), :]                   # Kx2 world landmarks
+
+        x_o, y_o, yaw_o = odom_pose
+        new_w = np.zeros_like(self.weights)
+        K = PB_sel.shape[0]
+
+        for i in range(self.Np):
+            dx, dy, dth = self.particles[i]
+            yaw_c = wrap(yaw_o + dth)
+            Rc = rot2d(yaw_c)
+            pc = np.array([x_o + dx, y_o + dy], float)
+            PW_pred = pc[None, :] + (PB_sel @ Rc.T)          # Kx2 world
+            diffs = PW_pred - MW
+            # Simple isotropic likelihood; joint gate with mild relax
+            m2_sum = float(np.sum(np.sum(diffs*diffs, axis=1) / (self.sigma_floor**2)))
+            gate = self.joint_relax * chi2_quantile(2*K, self.joint_sig)
+            like = self.like_floor if m2_sum > gate else max(math.exp(-0.5*m2_sum), self.like_floor)
+            new_w[i] = self.weights[i] * like
+
+        sw = float(np.sum(new_w))
+        if sw <= 0.0 or not math.isfinite(sw):
+            self.weights[:] = 1.0 / self.Np
+        else:
+            self.weights[:] = new_w / sw
+
+        neff = 1.0 / float(np.sum(self.weights * self.weights))
+        if neff < self.neff_ratio * self.Np:
+            self._systematic_resample()
+        return True
+
+    def _systematic_resample(self):
+        N = self.Np
+        positions = (np.arange(N) + np.random.uniform()) / N
+        indexes = np.zeros(N, 'i')
+        cs = np.cumsum(self.weights)
+        i, j = 0, 0
+        while i < N:
+            if positions[i] < cs[j]:
+                indexes[i] = j; i += 1
+            else:
+                j += 1
+        self.particles[:] = self.particles[indexes]
+        self.weights[:] = 1.0 / N
+
+    def _estimate_delta(self):
+        w = self.weights
+        dx = float(np.sum(w * self.particles[:, 0]))
+        dy = float(np.sum(w * self.particles[:, 1]))
+        cs = float(np.sum(w * np.cos(self.particles[:, 2])))
+        sn = float(np.sum(w * np.sin(self.particles[:, 2])))
+        dth = math.atan2(sn, cs)
+        return np.array([dx, dy, dth], float)
+
+    # ---------- cones feed ----------
     def cb_cones(self, msg: ConeArrayWithCovariance):
         if not self.pose_ready:
             return
-
         tz = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
-
-        # Throttle: process at ~target_cone_hz (0 = no throttle)
         if self.target_cone_hz > 0.0 and self._last_cone_ts is not None:
-            min_dt = 1.0 / max(1e-6, self.target_cone_hz)
-            if (tz - self._last_cone_ts) < min_dt:
+            if (tz - self._last_cone_ts) < (1.0 / max(1e-3, self.target_cone_hz)):
                 return
         self._last_cone_ts = tz
 
-        # If map already frozen by loop-closure: just republish and return (cheap)
-        if self.loop_frozen:
-            self._publish_map()
-            return
+        # Pose @ tz
+        odom_pose, dt_pose, v, yawrate = self._pose_at(tz)
+        x_o, y_o, yaw_o = odom_pose
 
-        Rwb = rot2d(self.yaw); pos = np.array([self.x, self.y], float)
+        # Use latest Δ̂ to build corrected pose used for gating & fusion
+        dxh, dyh, dthh = self.delta_hat if self.have_delta else (0.0, 0.0, 0.0)
+        x_c, y_c, yaw_c = x_o + dxh, y_o + dyh, wrap(yaw_o + dthh)
+        Rwb_c = rot2d(yaw_c); Rbw_c = Rwb_c.T
 
-        # Build detection list in WORLD
-        dets = []  # (pw, Sw, color)
-        big_orange_world = []  # store separately for loop-closure
+        # Build observations in BODY and WORLD (WORLD uses corrected pose)
+        obs_pb = []; obs_pw = []; obs_S0w = []; obs_color = []
         def add(arr, color_hint):
-            nonlocal big_orange_world
             for c in arr:
                 px = float(c.point.x); py = float(c.point.y)
                 Pw = np.array([[c.covariance[0], c.covariance[1]],
@@ -223,182 +335,206 @@ class OnlineMapper(Node):
                 Pw = Pw + np.diag([self.sigma_floor**2, self.sigma_floor**2]) + np.eye(2)*self.inflate_xy
                 if self.det_frame == "base":
                     pb = np.array([px, py], float)
-                    pw = pos + (Rwb @ pb)
-                    Sw = Rwb @ Pw @ Rwb.T
+                    pw = np.array([x_c, y_c]) + (Rwb_c @ pb)
+                    S0w = Rwb_c @ Pw @ Rwb_c.T
                 else:
                     pw = np.array([px, py], float)
-                    Sw = Pw
-                dets.append((pw, Sw, color_hint))
-                if color_hint == "big_orange":
-                    big_orange_world.append(pw)
+                    pb = Rbw_c @ (pw - np.array([x_c, y_c]))
+                    S0w = Pw
+                obs_pb.append(pb); obs_pw.append(pw); obs_S0w.append(S0w); obs_color.append(color_hint)
 
         add(msg.blue_cones, "blue")
         add(msg.yellow_cones, "yellow")
         add(msg.orange_cones, "orange")
         add(msg.big_orange_cones, "big_orange")
 
-        # --- Light loop-closure check (uses only big_orange cones) ---
-        if self.loop_enable and len(big_orange_world) >= 2:
-            self._maybe_loop_close(tz, big_orange_world)
-
-        # continue normal DA / mapping (unless frozen just now)
-        if self.loop_frozen:
-            self._publish_map()
+        n_obs = len(obs_pw)
+        if n_obs == 0:
             return
 
-        LM = np.array([lm['m'] for lm in self.landmarks], float) if self.landmarks else np.zeros((0,2), float)
+        # Landmark matrix
+        LM = np.stack([lm['m'] for lm in self.landmarks], axis=0) if self.landmarks else np.zeros((0,2), float)
 
-        upd = 0; new = 0
-        for (pw, Sw, col) in dets:
-            match = -1
-            best_m2 = 1e18
-            nearest_euclid2 = 1e18
+        # Candidate building with **S_gate = P_lm + S_eff**
+        now = tz
+        cands: List[List[Tuple[int,float]]] = []
+        total_cands = 0
 
+        for pw, S0w, pb, col in zip(obs_pw, obs_S0w, obs_pb, obs_color):
+            cc: List[Tuple[int, float]] = []
             if LM.shape[0] > 0:
-                diffs = LM - pw[None,:]
+                diffs = LM - pw[None, :]
                 d2 = np.einsum('ij,ij->i', diffs, diffs)
-                near = np.where(d2 <= self.crop_r2)[0]
-                if self.use_color:
-                    near = np.array([j for j in near if self._color_ok(self.landmarks[j]['color'], col)], dtype=int)
+                near = np.where(d2 <= self.crop2)[0]
                 if near.size > 0:
-                    nearest_euclid2 = float(np.min(d2[near]))
+                    r = float(np.linalg.norm(pb))
                     for j in near:
-                        P = self.landmarks[j]['P']
-                        S = P + Sw
-                        try: S_inv = np.linalg.inv(S)
-                        except np.linalg.LinAlgError: S_inv = np.linalg.pinv(S)
-                        innov = pw - self.landmarks[j]['m']
+                        lm = self.landmarks[j]
+                        # loose color: allow orange/big_orange mixing
+                        if (lm['color'] and col) and not (lm['color'] == col or ("orange" in lm['color'] and "orange" in col)):
+                            continue
+                        Pj = lm['P']
+                        S_eff = self._inflate_cov(S0w, v, yawrate, dt_pose if math.isfinite(dt_pose) else 0.0,
+                                                  r, yaw_c, now - lm['last_seen'])
+                        S_gate = Pj + S_eff  # <<<<<< FIXED: include landmark uncertainty
+                        try: S_inv = np.linalg.inv(S_gate)
+                        except np.linalg.LinAlgError: S_inv = np.linalg.pinv(S_gate)
+                        innov = pw - lm['m']
                         m2 = float(innov.T @ S_inv @ innov)
-                        if m2 < best_m2 and m2 <= self.chi2_gate:
-                            best_m2 = m2; match = int(j)
+                        if m2 <= self.chi2_gate:
+                            cc.append((int(j), m2))
+                    if cc:
+                        cc.sort(key=lambda t: t[1])
+                        if self.max_cands_per_obs > 0:
+                            cc = cc[:self.max_cands_per_obs]
+            cands.append(cc)
+            total_cands += len(cc)
 
-            create = (match < 0)
-            if not create and self.min_sep > 0.0 and nearest_euclid2 > (self.min_sep**2):
-                create = True
+        # Order & limit obs for JCBB
+        order = sorted(range(n_obs), key=lambda i: len(cands[i]) if cands[i] else 9999)
+        if self.max_obs_for_jcbb > 0:
+            order = order[:self.max_obs_for_jcbb]
+        cands_ord = [cands[i] for i in order]
 
-            if create:
-                P0 = Sw + np.eye(2)*self.init_lm_var
-                self.landmarks.append({'m': pw.copy(), 'P': P0, 'color': col, 'hits': 1, 'last_seen': tz})
-                new += 1
-                LM = np.vstack([LM, pw[None,:]]) if LM.size else pw.reshape(1,2)
-            else:
-                lm = self.landmarks[match]
-                m = lm['m']; P = lm['P']
-                S = P + Sw
-                try: S_inv = np.linalg.inv(S)
-                except np.linalg.LinAlgError: S_inv = np.linalg.pinv(S)
-                K = P @ S_inv
-                innov = pw - m
-                m_new = m + K @ innov
-                P_new = (np.eye(2) - K) @ P
-                lm['m'] = m_new
-                lm['P'] = 0.5*(P_new + P_new.T)
-                lm['hits'] += 1
-                lm['last_seen'] = tz
-                upd += 1
-                LM[match,:] = m_new
+        # JCBB (bounded)
+        best_pairs: List[Tuple[int,int,float]] = []
+        best_K = 0
+        used = set()
+        t_start = time.perf_counter()
+        time_budget = self.time_budget_ms/1000.0
+
+        def dfs(idx, cur_pairs, cur_sum):
+            nonlocal best_pairs, best_K
+            if (time.perf_counter() - t_start) > time_budget:
+                return
+            cur_K = len(cur_pairs)
+            if cur_K + (len(cands_ord) - idx) < best_K:
+                return
+            if cur_K >= self.min_k_for_joint:
+                df = 2*cur_K
+                thresh = self.joint_relax * chi2_quantile(df, self.joint_sig)
+                if cur_sum > thresh:
+                    return
+            if idx == len(cands_ord):
+                if cur_K > best_K:
+                    best_K = cur_K; best_pairs = cur_pairs.copy(); 
+                return
+            # skip
+            dfs(idx+1, cur_pairs, cur_sum)
+            # try
+            for (mid, m2) in cands_ord[idx]:
+                if mid in used:
+                    continue
+                used.add(mid)
+                cur_pairs.append((order[idx], mid, m2))
+                dfs(idx+1, cur_pairs, cur_sum + m2)
+                cur_pairs.pop()
+                used.remove(mid)
+
+        dfs(0, [], 0.0)
+
+        # ---- PF Δ update (against current map) ----
+        if best_K >= 2 and LM.shape[0] > 0:
+            self._pf_predict()
+            _ = self._pf_update(best_pairs, odom_pose, obs_pb, LM)  # uses odom_pose (uncorrected) + LM
+            self.delta_hat = self._estimate_delta()
+            self.have_delta = True
+
+            # Recompute corrected pose with NEW Δ for fusion accuracy
+            dxh, dyh, dthh = self.delta_hat
+            x_c, y_c, yaw_c = x_o + dxh, y_o + dyh, wrap(yaw_o + dthh)
+            Rwb_c = rot2d(yaw_c)
+
+        # ---- EKF-style fuse for matched; create new for unmatched (conservative) ----
+        # Recompute per-observation pw/S0 under UPDATED corrected pose ONLY for matched obs (cheap).
+        def obs_world_from_pb(pb, Pw_base):
+            pw = np.array([x_c, y_c]) + (Rwb_c @ pb)
+            S0w = Rwb_c @ Pw_base @ Rwb_c.T
+            return pw, S0w
+
+        # Build base cov (before rotation) for reuse. We kept inflated Pw earlier; rebuild base Pw once.
+        Pw_base_all = []
+        for pb, S0w in zip(obs_pb, obs_S0w):
+            # S0w = R Pw_base R^T, recover Pw_base approx via current R (ok since we use the same R)
+            # but we don't strictly need this; simpler: keep the pre-rotated Pw at creation time.
+            # To keep it simple, reuse S0w with new Rwb_c (small bias). Good enough for fusion.
+            Pw_base_all.append(S0w)  # treated as if base; approximation is fine at this scale.
+
+        matched_obs_idx = set([oi for (oi, _, _) in best_pairs])
+        matched_map_idx = set([mj for (_, mj, _) in best_pairs])
+
+        upd = 0
+        for (oi, mj, _) in best_pairs:
+            lm = self.landmarks[mj]
+            # recompute observation in WORLD under updated corrected pose
+            pw, S0w = obs_world_from_pb(obs_pb[oi], Pw_base_all[oi])
+            P = lm['P']; m = lm['m']
+            S = P + S0w
+            try: S_inv = np.linalg.inv(S)
+            except np.linalg.LinAlgError: S_inv = np.linalg.pinv(S)
+            K = P @ S_inv
+            innov = pw - m
+            m_new = m + K @ innov
+            P_new = (np.eye(2) - K) @ P
+            lm['m'] = m_new
+            lm['P'] = 0.5*(P_new + P_new.T)
+            lm['hits'] += 1
+            lm['last_seen'] = tz
+            upd += 1
+
+        # New landmarks: create only if zero candidates (no ambiguity)
+        new = 0
+        for oi in range(n_obs):
+            if oi in matched_obs_idx:
+                continue
+            if cands[oi]:  # there was ambiguity → skip creation this frame
+                continue
+            # recompute under corrected pose
+            pb = obs_pb[oi]
+            pw, S0w = obs_world_from_pb(pb, Pw_base_all[oi])
+            P0 = S0w + np.eye(2)*self.init_lm_var
+            col = obs_color[oi]
+            self.landmarks.append({'m': pw.copy(), 'P': P0, 'color': col, 'hits': 1, 'last_seen': tz})
+            new += 1
+
+        # Optional: min_separation guard against accidental duplicates
+        if self.min_sep > 0.0 and self.landmarks:
+            LM_now = np.stack([lm['m'] for lm in self.landmarks], axis=0)
+            sep2 = self.min_sep**2
+            keep = []
+            for idx, lm in enumerate(self.landmarks):
+                diffs = LM_now - lm['m'][None, :]
+                d2 = np.einsum('ij,ij->i', diffs, diffs)
+                d2[idx] = float('inf')
+                if float(np.min(d2)) < 1e-9 or float(np.min(d2)) >= sep2:
+                    keep.append(lm)
+            self.landmarks = keep
 
         self._publish_map()
+
+        mean_cands = total_cands / max(1, n_obs)
+        timed_out = (time.perf_counter() - t_start) > time_budget
         self.get_logger().info(
-            f"[mapper] t={tz:7.2f}s det={len(dets)} upd={upd} new={new} LM={len(self.landmarks)}"
-            + (f" | throttled to ~{self.target_cone_hz:.1f} Hz" if self.target_cone_hz > 0.0 else "")
+            f"[map/jcbb+pf] t={tz:7.2f}s obs={n_obs} mean_cands/obs={mean_cands:.2f} "
+            f"matched={best_K} upd={upd} new={new} LM={len(self.landmarks)} "
+            f"Δ̂=[{self.delta_hat[0]:+.3f},{self.delta_hat[1]:+.3f},{math.degrees(self.delta_hat[2]):+.2f}°]"
+            f"{' | JCBB:timeout' if timed_out else ''}"
         )
 
-    # -------- loop-closure utilities --------
-    def _maybe_loop_close(self, tz: float, gate_pts: List[np.ndarray]):
-        """
-        gate_pts: WORLD positions of currently seen big_orange cones
-        """
-        # Build candidate big_orange pairs with plausible separation
-        cand_pairs: List[Tuple[np.ndarray,np.ndarray,float,np.ndarray]] = []
-        n = len(gate_pts)
-        for i in range(n):
-            for j in range(i+1, n):
-                p1, p2 = gate_pts[i], gate_pts[j]
-                d = float(np.linalg.norm(p2 - p1))
-                if self.loop_min_sep <= d <= self.loop_max_sep:
-                    c = 0.5*(p1 + p2)  # centroid
-                    cand_pairs.append((p1, p2, d, c))
-        if not cand_pairs:
-            return
+    # ---------- math helpers ----------
+    def _inflate_cov(self, S0_w: np.ndarray, v: float, yawrate: float, dt: float,
+                     r: float, yaw: float, stale_dt: float) -> np.ndarray:
+        trans_var = self.alpha * (v**2) * (dt**2)
+        lateral_var = self.beta * (yawrate**2) * (dt**2) * (r**2)
+        R = rot2d(yaw)
+        Jrot = R @ np.array([[0.0, 0.0], [0.0, lateral_var]]) @ R.T
+        S = S0_w + np.diag([trans_var, trans_var]) + Jrot
+        if stale_dt > self.stale_T:
+            S *= self.stale_mul
+        S[0,0] += 1e-9; S[1,1] += 1e-9
+        return S
 
-        # No anchor yet? Set from widest plausible pair.
-        if self.anchor_gate is None and len(self.landmarks) >= 2:
-            p1, p2, d, c = max(cand_pairs, key=lambda t: t[2])
-            self.anchor_gate = (p1.copy(), p2.copy())
-            self.anchor_sep = d
-            self.anchor_centroid = c.copy()
-            self._last_loop_event_ts = tz
-            self.get_logger().info(f"[loop] Anchor gate set: sep={d:.2f} m @ {self.anchor_centroid.round(2).tolist()}")
-            return
-
-        if self.anchor_gate is None:
-            return
-
-        # Cooldown
-        if (tz - self._last_loop_event_ts) < self.loop_cooldown:
-            return
-
-        # Must have a reasonably sized map
-        if len(self.landmarks) < self.loop_min_lm:
-            return
-
-        # Car must be back near the anchor AND (optionally) stopped
-        pos = np.array([self.x, self.y], float)
-        if float(np.linalg.norm(pos - self.anchor_centroid)) > self.loop_close_r:
-            return
-        if self.loop_require_stop and (self.speed > self.loop_stop_speed):
-            return
-
-        # Choose candidate pair whose centroid AND separation match the anchor
-        best = None; best_cost = 1e9
-        for p1, p2, d, c in cand_pairs:
-            if float(np.linalg.norm(c - self.anchor_centroid)) > self.loop_close_r:
-                continue
-            sep_err = abs(d - self.anchor_sep)
-            if sep_err <= self.loop_sep_tol and sep_err < best_cost:
-                best = (p1, p2); best_cost = sep_err
-        if best is None:
-            return
-
-        # Compute SE(2) transform CURRENT gate -> ANCHOR gate
-        (a1, a2) = self.anchor_gate
-        (b1, b2) = best
-        T_R, T_t = self._se2_from_pairs(src1=b1, src2=b2, dst1=a1, dst2=a2)
-
-        # Apply to all landmarks (positions and covariances)
-        for lm in self.landmarks:
-            m = lm['m']
-            lm['m'] = (T_R @ m) + T_t
-            P = lm['P']
-            lm['P'] = T_R @ P @ T_R.T
-
-        self.loop_frozen = True
-        self._last_loop_event_ts = tz
-        self.get_logger().info(
-            f"[loop] CLOSED at start gate (car near & stopped). Applied rigid correction; map frozen. "
-            f"Δθ={math.degrees(math.atan2(T_R[1,0], T_R[0,0])):+.2f}°  t={T_t.round(3).tolist()}"
-        )
-
-    @staticmethod
-    def _se2_from_pairs(src1: np.ndarray, src2: np.ndarray,
-                        dst1: np.ndarray, dst2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Given two 2D point correspondences (src->dst) assuming no scale,
-        compute rotation R and translation t such that: R*src + t ≈ dst.
-        """
-        v_src = src2 - src1
-        v_dst = dst2 - dst1
-        ang_src = math.atan2(v_src[1], v_src[0])
-        ang_dst = math.atan2(v_dst[1], v_dst[0])
-        dth = wrap(ang_dst - ang_src)
-        R = rot2d(dth)
-        c_src = 0.5*(src1 + src2)
-        c_dst = 0.5*(dst1 + dst2)
-        t = c_dst - (R @ c_src)
-        return R, t
-
-    # ---- publish ----
+    # ---------- publisher ----------
     def _publish_map(self):
         if not self.landmarks:
             return
@@ -409,20 +545,14 @@ class OnlineMapper(Node):
             add_cone(out, float(lm['m'][0]), float(lm['m'][1]), lm['P'], lm['color'])
         self.pub_map.publish(out)
 
-    def _color_ok(self, lm_c: str, obs_c: str) -> bool:
-        if not lm_c or not obs_c: return True
-        if lm_c == obs_c: return True
-        if ("orange" in lm_c) and ("orange" in obs_c): return True
-        return False
-
 # ---------- main ----------
 def main():
     rclpy.init()
-    node = OnlineMapper()
+    node = JCBBMapper()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-            pass
+        pass
     finally:
         if rclpy.ok():
             rclpy.shutdown()
