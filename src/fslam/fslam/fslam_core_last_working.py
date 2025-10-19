@@ -118,8 +118,8 @@ class FastSLAMCore(Node):
         super().__init__("fastslam_core", automatically_declare_parameters_from_overrides=True)
 
         # topics
-        # self.declare_parameter("topics.odom_in","/ground_truth/odom")
-        self.declare_parameter("topics.odom_in","/odometry_integration/car_state")
+        self.declare_parameter("topics.odom_in","/ground_truth/odom")
+        # self.declare_parameter("topics.odom_in","/odometry_integration/car_state")
         self.declare_parameter("topics.cones","/ground_truth/cones")
         self.declare_parameter("topics.odom_out","/fastslam/odom")
         self.declare_parameter("topics.map_out","/fastslam/map_cones")
@@ -196,7 +196,7 @@ class FastSLAMCore(Node):
         self.persist_seen_th = int(gp("landmark.persist_seen_threshold").value)
         self.like_floor      = float(gp("like_floor").value)
 
-        # qos/io (UNCHANGED per your request)
+        # qos/io (UNCHANGED)
         qos_in=QoSProfile(history=QoSHistoryPolicy.KEEP_LAST, depth=200,
                           reliability=QoSReliabilityPolicy.BEST_EFFORT,
                           durability=QoSDurabilityPolicy.VOLATILE)
@@ -230,26 +230,8 @@ class FastSLAMCore(Node):
             "big"   : {"mu":np.zeros((0,2)), "S":np.zeros((0,2,2)), "seen":np.zeros((0,),int), "t":np.zeros((0,))},
         }
 
-        # cache last cones stamp (for publish)
+        # cache last cones stamp for publish
         self._last_cones_stamp_msg = None
-
-        # -------- Loop-closure params & state (big_orange anchors) --------
-        self.declare_parameter("loop.enable", True)
-        self.declare_parameter("loop.min_pairs", 2)         # need at least 2 anchor pairs
-        self.declare_parameter("loop.max_mahal2", 9.0)      # gate for pairing (df=2 ~ 3σ)
-        self.declare_parameter("loop.max_rms_m", 0.6)       # accept if RMS residual < this
-        self.declare_parameter("loop.blend", 0.2)           # how hard to blend pose correction
-
-        self.loop_enable   = bool(self.get_parameter("loop.enable").value)
-        self.loop_min_pairs= int(self.get_parameter("loop.min_pairs").value)
-        self.loop_max_m2   = float(self.get_parameter("loop.max_mahal2").value)
-        self.loop_max_rms  = float(self.get_parameter("loop.max_rms_m").value)
-        self.loop_blend    = float(self.get_parameter("loop.blend").value)
-
-        self._lc_has_T = False
-        self._lc_R = np.eye(2)
-        self._lc_t = np.zeros(2)
-        self._lc_dtheta = 0.0
 
     def _make_particle(self):
         z2=(0,2,2)
@@ -270,8 +252,10 @@ class FastSLAMCore(Node):
         x=float(msg.pose.pose.position.x); y=float(msg.pose.pose.position.y)
         q=msg.pose.pose.orientation; yaw=yaw_from_quat(q.x,q.y,q.z,q.w)
         vx=float(msg.twist.twist.linear.x); vy=float(msg.twist.twist.linear.y)
-        v=math.hypot(vx,vy); yr=float(msg.twist.twist.angular.z)
-        self.odom_buf.push(t,x,y,yaw,v,yr)
+        # [PRED-FIX] use forward speed along heading for the unicycle model
+        v_fwd = vx*math.cos(yaw) + vy*math.sin(yaw)
+        yr=float(msg.twist.twist.angular.z)
+        self.odom_buf.push(t,x,y,yaw,v_fwd,yr)   # [PRED-FIX] store forward speed
         self.pose_ready=True
 
         if self.have_delta:
@@ -283,8 +267,8 @@ class FastSLAMCore(Node):
         od.header.frame_id="map"; od.child_frame_id="base_link"
         od.pose=PoseWithCovariance(); od.twist=TwistWithCovariance()
         od.pose.pose=Pose(position=Point(x=x_c,y=y_c,z=0.0),orientation=quat_from_yaw(yaw_c))
-        # Twist is in base frame
-        od.twist.twist=Twist(linear=Vector3(x=v, y=0.0, z=0.0),
+        # Twist must be in child (base_link) frame
+        od.twist.twist=Twist(linear=Vector3(x=v_fwd, y=0.0, z=0.0),  # [PRED-FIX] publish forward speed
                              angular=Vector3(x=0.0,y=0.0,z=yr))
         self.pub_odom.publish(od)
         p2=Pose2D(); p2.x=x_c; p2.y=y_c; p2.theta=yaw_c
@@ -304,7 +288,7 @@ class FastSLAMCore(Node):
         self.promote_window = float(np.clip(3.0*(self._rx_dt_ema if self._rx_dt_ema else 1.0), 0.6, 4.0))
 
         self.last_cone_ts=t_z
-        self._last_cones_stamp_msg = msg.header.stamp
+        self._last_cones_stamp_msg = msg.header.stamp  # forward original stamp
 
         od_pose,dt_pose,v_local,yr_local=self.odom_buf.pose_at(t_z)
         dt_pose = 0.0 if not math.isfinite(dt_pose) else dt_pose
@@ -329,18 +313,11 @@ class FastSLAMCore(Node):
 
         bi=int(np.argmax(self.weights))
         best=self.particles[bi]
-
-        # -------- implicit loop closure using big_orange anchors --------
-        if self.loop_enable:
-            self._try_loop_closure(best)
-
-        # publish odom correction relative to raw odom
-        self.delta_hat[:]=self._compute_delta(self._apply_T_to_pose(best["pose"]) if self._lc_has_T else best["pose"],
-                                              od_pose=self.odom_buf.latest.copy())
+        self.delta_hat[:]=self._compute_delta(best["pose"], od_pose=self.odom_buf.latest.copy())
         self.have_delta=True
 
-        # fuse into persistent global map (apply T if active)
-        self._accumulate_global_map(best, t_z, apply_loop_T=self._lc_has_T)
+        # update persistent global map from best
+        self._accumulate_global_map(best, t_z)
 
         # publish persistent map
         self._publish_map_persistent(self._last_cones_stamp_msg)
@@ -409,7 +386,7 @@ class FastSLAMCore(Node):
             R_eff = self._inflate_R(Rw, v, yr, dt_pose, r)
             obs_world.append((pw,R_eff))
 
-        # Distance prefilter by crop radius
+        # Distance prefilter landmarks by crop radius
         remap = None
         if MU.shape[0] > 0 and math.isfinite(self.crop2) and self.crop2 < float("inf"):
             d2 = np.sum((MU - pose_xy.reshape(1,2))**2, axis=1)
@@ -424,7 +401,7 @@ class FastSLAMCore(Node):
             MU_pref = MU
             S_pref  = S
 
-        # Candidates by Mahalanobis
+        # Build candidate lists using Mahalanobis
         cands=[]
         for (pw, R_eff) in obs_world:
             cc=[]
@@ -436,7 +413,7 @@ class FastSLAMCore(Node):
                 if not np.isfinite(innov).all(): continue
                 m2 = float(innov.T @ Sinv @ innov)
                 if m2 <= self.gate:
-                    real_mid = remap[mid] if remap is not None else mid
+                    real_mid = remap[mid] if remap is not None else mid  # map back to original index
                     cc.append((real_mid, m2, R_eff))
             if len(cc) > self.jcbb_topk:
                 cc = sorted(cc, key=lambda t: t[1])[:self.jcbb_topk]
@@ -551,6 +528,7 @@ class FastSLAMCore(Node):
                         except Exception:
                             m2 = float('inf')
                         if m2 < self.merge_m2_gate:
+                            # weighted merge (simple average is fine here)
                             T[k]=(0.5*p+0.5*p_world, t0, t_z, cnt+1, 0.5*(SR + Rw))
                             merged=True; break
                     if not merged:
@@ -568,7 +546,7 @@ class FastSLAMCore(Node):
             bank["mu"]=MU; bank["Sigma"]=S; bank["seen"]=seen; bank["t"]=tt
             self._dedup_bank(bank)
 
-            # aging / persistence
+            # aging: obey your persist settings (UNCHANGED)
             if bank["mu"].shape[0]>0 and (not self.persist):
                 alive = (t_z - bank["t"]) <= self.max_age
                 bank["mu"]    = bank["mu"][alive]
@@ -657,26 +635,14 @@ class FastSLAMCore(Node):
             merged_tt.append(float(tmax))
         bank["mu"]   = np.vstack(merged_mu) if merged_mu else np.zeros((0,2))
         bank["Sigma"]= np.vstack(merged_S)  if merged_S  else np.zeros((0,2,2))
-        bank["seen"] = np.array(merged_seen, dtype=int) if merged_seen else np.zeros((0,), dtype=int)
+        bank["seen"] = np.array(merged_seen, dtype=int) if merged_seen else np.zeros((0,), dtype=int)  # NOTE: typo fixed below
         bank["t"]    = np.array(merged_tt, dtype=float) if merged_tt else np.zeros((0,), dtype=float)
 
     # -------- persistent global map accumulation --------
-    def _accumulate_global_map(self, best, t_now, apply_loop_T=False):
-        # If loop-closure estimated a transform, apply it to all colors before fusing
-        def maybe_transform_mu_S(mu, S):
-            if not apply_loop_T or not self._lc_has_T or mu.shape[0]==0:
-                return mu, S
-            R = self._lc_R; t = self._lc_t.reshape(1,2)
-            mu_t = (mu @ R.T) + t
-            S_t  = np.empty_like(S)
-            for i in range(S.shape[0]):
-                S_t[i] = R @ S[i] @ R.T
-            return mu_t, S_t
-
+    def _accumulate_global_map(self, best, t_now):
         for name in ("blue","yellow","orange","big"):
             gm = self.global_map[name]
             MU = best["maps"][name]["mu"]; S = best["maps"][name]["Sigma"]
-            MU, S = maybe_transform_mu_S(MU, S)
             if MU.shape[0]==0: continue
             if gm["mu"].shape[0]==0:
                 gm["mu"]=MU.copy(); gm["S"]=S.copy()
@@ -711,6 +677,7 @@ class FastSLAMCore(Node):
 
     def _publish_map_persistent(self, ros_stamp_msg):
         msg = ConeArrayWithCovariance()
+        # publish with original cones stamp
         msg.header.stamp = ros_stamp_msg if ros_stamp_msg is not None else rclpy.time.Time().to_msg()
         msg.header.frame_id = "map"
         def bank(mu, Sigma):
@@ -729,78 +696,6 @@ class FastSLAMCore(Node):
         msg.orange_cones     = bank(gm["orange"]["mu"], gm["orange"]["S"])
         msg.big_orange_cones = bank(gm["big"]["mu"],    gm["big"]["S"])
         self.pub_map.publish(msg)
-
-    # -------------------- Loop-closure helpers --------------------
-    def _apply_T_to_pose(self, pose):
-        """Apply current loop-closure SE2 transform to a [x,y,yaw] pose (if available)."""
-        if not self._lc_has_T: return pose
-        x,y,yaw = pose
-        pt = np.array([x,y]) @ self._lc_R.T + self._lc_t
-        return np.array([float(pt[0]), float(pt[1]), wrap(yaw + self._lc_dtheta)], float)
-
-    def _try_loop_closure(self, best):
-        """Use big_orange anchors: align current best big cones to global big cones."""
-        cur = best["maps"]["big"]
-        gm  = self.global_map["big"]
-        MUc, Sc = cur["mu"], cur["Sigma"]
-        MUg, Sg = gm["mu"], gm["S"]
-        if MUc.shape[0] < 2 or MUg.shape[0] < 2:
-            self._lc_has_T = False
-            return
-
-        # Build matches via nearest Mahalanobis neighbours with gate
-        pairs_a=[]  # current points
-        pairs_b=[]  # global points
-        for i in range(MUc.shape[0]):
-            mu_i = MUc[i]; Si = Sc[i]
-            best_d = 1e18; best_j = -1
-            for j in range(MUg.shape[0]):
-                d = mahal2(mu_i, Si, MUg[j], Sg[j])
-                if d < best_d: best_d, best_j = d, j
-            if best_d <= self.loop_max_m2 and best_j >= 0:
-                pairs_a.append(mu_i); pairs_b.append(MUg[best_j])
-
-        if len(pairs_a) < self.loop_min_pairs:
-            self._lc_has_T = False
-            return
-
-        A = np.asarray(pairs_a)  # Nx2 current
-        B = np.asarray(pairs_b)  # Nx2 global
-
-        # Solve SE2 (2D Procrustes): find R,t minimizing ||B - (A R^T + t)||
-        Ac = A.mean(axis=0, keepdims=True)
-        Bc = B.mean(axis=0, keepdims=True)
-        A0 = A - Ac
-        B0 = B - Bc
-        H = A0.T @ B0  # 2x2
-        # For 2D, rotation angle from cross-covariance
-        # theta = atan2(h01 - h10, h00 + h11)
-        theta = math.atan2(H[0,1] - H[1,0], H[0,0] + H[1,1])
-        R = rot2d(theta)
-        t = (Bc - Ac @ R.T).reshape(2)
-
-        # Compute RMS residual
-        A_to_B = (A @ R.T) + t.reshape(1,2)
-        resid = np.sqrt(np.mean(np.sum((B - A_to_B)**2, axis=1)))
-
-        if not np.isfinite(resid) or resid > self.loop_max_rms:
-            self._lc_has_T = False
-            return
-
-        # Accept transform: blend with previous (smoothness)
-        if self._lc_has_T:
-            # slerp-ish for 2D
-            theta_old = self._lc_dtheta
-            theta_new = wrap((1.0 - self.loop_blend)*theta_old + self.loop_blend*theta)
-            R_new = rot2d(theta_new)
-            t_new = (1.0 - self.loop_blend)*self._lc_t + self.loop_blend*t
-            self._lc_R = R_new; self._lc_t = t_new; self._lc_dtheta = theta_new
-        else:
-            self._lc_R = R; self._lc_t = t; self._lc_dtheta = theta
-        self._lc_has_T = True
-
-        # Also blend pose-correction immediately to keep published odom tight
-        # (delta_hat is updated after this call using _apply_T_to_pose)
 
     # -------------------- PF boilerplate --------------------
     def _resample_systematic_deep(self):
