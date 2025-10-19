@@ -24,7 +24,6 @@ def quat_from_yaw(yaw):
     q=Quaternion(); q.x=0.0; q.y=0.0; q.z=math.sin(yaw/2.0); q.w=math.cos(yaw/2.0)
     return q
 
-# normal quantile & chi2 quantile
 def _norm_ppf(p):
     if p<=0.0: return -float('inf')
     if p>=1.0: return float('inf')
@@ -50,13 +49,13 @@ def chi2_quantile(dof,p):
     t=1.0-2.0/(9.0*k)+z*math.sqrt(2.0/(9.0*k))
     return k*(t**3)
 
-# numerically safe KF bits
 def spd_joseph_update(P, H, R, K):
     I = np.eye(P.shape[0]); A = (I - K @ H)
     Pn = A @ P @ A.T + K @ R @ K.T
     Pn = 0.5*(Pn + Pn.T)
     w,v = np.linalg.eigh(Pn); w = np.clip(w, 1e-9, None)
     return (v * w) @ v.T
+
 def safe_inv_and_logdet(S):
     try:
         Sinv = np.linalg.inv(S)
@@ -68,6 +67,7 @@ def safe_inv_and_logdet(S):
         s = np.clip(s, 1e-12, None)
         logdet = float(np.sum(np.log(s)))
     return Sinv, logdet
+
 def mahal2(mu_a, S_a, mu_b, S_b):
     d = (mu_a - mu_b).reshape(2,1)
     S = S_a + S_b
@@ -119,13 +119,13 @@ class FastSLAMCore(Node):
 
         # topics
         self.declare_parameter("topics.odom_in","/odometry_integration/car_state")
-        self.declare_parameter("topics.cones","/ground_truth/cones")  # your choice; leave as-is
+        self.declare_parameter("topics.cones","/ground_truth/cones")
         self.declare_parameter("topics.odom_out","/fastslam/odom")
         self.declare_parameter("topics.map_out","/fastslam/map_cones")
 
         # frames & rate
-        self.declare_parameter("detections_frame","base")   # base as you set
-        self.declare_parameter("target_cone_hz",25.0)       # NOT used for throttling anymore
+        self.declare_parameter("detections_frame","base")   # your source says base
+        self.declare_parameter("target_cone_hz",25.0)       # informative only
 
         # gates (looser)
         self.declare_parameter("chi2_gate_2d",9.210)        # ~99% df=2
@@ -146,12 +146,17 @@ class FastSLAMCore(Node):
         self.declare_parameter("pf.process_std_yaw_rad",0.002)
 
         # birth/merge
-        self.declare_parameter("birth.promote_count",1)     # you wanted aggressive; kept
-        self.declare_parameter("birth.promote_window_s",1.0) # will be rate-adapted
+        self.declare_parameter("birth.promote_count",1)
+        self.declare_parameter("birth.promote_window_s",1.0)  # gets adapted to rate
         self.declare_parameter("birth.merge_radius_m",0.8)
         self.declare_parameter("merge.mahal_gate2",6.0)
         self.declare_parameter("jcbb.topk",4)
-        self.declare_parameter("landmark.max_age_s",6.0)    # slower feeds → longer age
+
+        # persistence / aging
+        self.declare_parameter("landmark.max_age_s",6.0)       # only used if persist=False
+        self.declare_parameter("landmark.persist", True)       # keep credible LM forever
+        self.declare_parameter("landmark.persist_seen_threshold", 3)
+
         self.declare_parameter("like_floor",1e-12)
 
         # resolve
@@ -164,7 +169,7 @@ class FastSLAMCore(Node):
         self.frame_mode      = str(gp("detections_frame").value).lower()
         if self.frame_mode not in ("world","base"): self.frame_mode="base"
 
-        self.t_cone          = float(gp("target_cone_hz").value)  # informational only
+        self.t_cone          = float(gp("target_cone_hz").value)
         self.gate            = float(gp("chi2_gate_2d").value)
         self.joint_sig       = float(gp("joint_sig").value)
         self.joint_relax     = float(gp("joint_relax").value)
@@ -180,11 +185,14 @@ class FastSLAMCore(Node):
         self.p_std_yaw       = float(gp("pf.process_std_yaw_rad").value)
 
         self.promote_count   = int(gp("birth.promote_count").value)
-        self.promote_window  = float(gp("birth.promote_window_s").value)  # adapted
+        self.promote_window  = float(gp("birth.promote_window_s").value)
         self.merge_radius    = float(gp("birth.merge_radius_m").value)
         self.merge_m2_gate   = float(gp("merge.mahal_gate2").value)
         self.jcbb_topk       = int(gp("jcbb.topk").value)
+
         self.max_age         = float(gp("landmark.max_age_s").value)
+        self.persist         = bool(gp("landmark.persist").value)
+        self.persist_seen_th = int(gp("landmark.persist_seen_threshold").value)
         self.like_floor      = float(gp("like_floor").value)
 
         # qos/io
@@ -213,6 +221,14 @@ class FastSLAMCore(Node):
         self._ema_alpha = 0.2
         self._now_s = lambda: self.get_clock().now().nanoseconds * 1e-9
 
+        # persistent fused map (world frame)
+        self.global_map = {
+            "blue"  : {"mu":np.zeros((0,2)), "S":np.zeros((0,2,2)), "seen":np.zeros((0,),int), "t":np.zeros((0,))},
+            "yellow": {"mu":np.zeros((0,2)), "S":np.zeros((0,2,2)), "seen":np.zeros((0,),int), "t":np.zeros((0,))},
+            "orange": {"mu":np.zeros((0,2)), "S":np.zeros((0,2,2)), "seen":np.zeros((0,),int), "t":np.zeros((0,))},
+            "big"   : {"mu":np.zeros((0,2)), "S":np.zeros((0,2,2)), "seen":np.zeros((0,),int), "t":np.zeros((0,))},
+        }
+
     def _make_particle(self):
         z2=(0,2,2)
         return {
@@ -236,7 +252,6 @@ class FastSLAMCore(Node):
         self.odom_buf.push(t,x,y,yaw,v,yr)
         self.pose_ready=True
 
-        # map odom out using best delta
         if self.have_delta:
             dx,dy,dth=self.delta_hat; x_c=x+dx; y_c=y+dy; yaw_c=wrap(yaw+dth)
         else:
@@ -256,23 +271,20 @@ class FastSLAMCore(Node):
         if not self.pose_ready: return
         t_z=RclTime.from_msg(msg.header.stamp).nanoseconds*1e-9
 
-        # NO THROTTLE. Adapt to observed rate.
+        # adapt to observed rate (no throttling)
         now = self._now_s()
         if hasattr(self, "_last_rx"):
             dt_rx = max(1e-3, now - self._last_rx)
             self._rx_dt_ema = dt_rx if self._rx_dt_ema is None else \
                 (1 - self._ema_alpha)*self._rx_dt_ema + self._ema_alpha*dt_rx
         self._last_rx = now
-        # Effective promotion window ≈ 3× observed period, clamped
-        eff_window = 3.0*(self._rx_dt_ema if self._rx_dt_ema else 1.0)
-        self.promote_window = float(np.clip(eff_window, 0.6, 4.0))
+        self.promote_window = float(np.clip(3.0*(self._rx_dt_ema if self._rx_dt_ema else 1.0), 0.6, 4.0))
 
         self.last_cone_ts=t_z
 
         od_pose,dt_pose,v_local,yr_local=self.odom_buf.pose_at(t_z)
         dt_pose = 0.0 if not math.isfinite(dt_pose) else dt_pose
 
-        # proposal
         for i in range(self.Np):
             self.particles[i]["pose"]=self._propose_pose(od_pose, v_local, yr_local, dt_pose)
 
@@ -295,7 +307,12 @@ class FastSLAMCore(Node):
         best=self.particles[bi]
         self.delta_hat[:]=self._compute_delta(best["pose"], od_pose=self.odom_buf.latest.copy())
         self.have_delta=True
-        self._publish_map(best,t_z)
+
+        # update persistent global map from best
+        self._accumulate_global_map(best, t_z)
+
+        # publish persistent map
+        self._publish_map_persistent(t_z)
 
     # -------------------- core ops --------------------
     def _compute_delta(self,pose_particle, od_pose):
@@ -343,8 +360,7 @@ class FastSLAMCore(Node):
         obs_world=[]
         for (z, Rm) in OBS:
             if self.frame_mode=="base":
-                pw = pose_xy + Rwb @ z
-                Rw = Rwb @ Rm @ Rwb.T
+                pw = pose_xy + Rwb @ z; Rw = Rwb @ Rm @ Rwb.T
             else:
                 pw = z.copy(); Rw = Rm.copy()
             r = float(np.linalg.norm(pw - pose_xy))
@@ -376,7 +392,7 @@ class FastSLAMCore(Node):
                 if K>best_K or (K==best_K and sum_m2<best_sum):
                     best_pairs=cur.copy(); best_K=K; best_sum=sum_m2
                 return
-            dfs(idx+1,cur,sum_m2)  # skip obs
+            dfs(idx+1,cur,sum_m2)
             for (mid,m2,R_eff) in cands_ord[idx]:
                 if mid in used: continue
                 new_sum=sum_m2+m2; K_new=len(cur)+1
@@ -424,11 +440,7 @@ class FastSLAMCore(Node):
                     bank["Sigma"]= np.vstack(S_list)
                     bank["t"]    = np.array(t_list, float)
                     bank["seen"] = np.array(s_list, int)
-                    # refresh local refs
                     MU=bank["mu"]; S=bank["Sigma"]; seen=bank["seen"]; tt=bank["t"]
-                # continue to next color (no pairs possible this cycle)
-                # (we let JCBB still run in case there are multiple OBS; but empty->seed means no pairs)
-                if MU.shape[0]==0: continue
 
             pairs = self._jcbb(OBS, MU, S, pose_p, dt_pose, v, yr, self.crop2)
 
@@ -459,9 +471,9 @@ class FastSLAMCore(Node):
                 S[mi] = spd_joseph_update(S[mi], H, R_eff, K)
                 seen[mi] += 1; tt[mi] = t_z
                 m2_ll = float(innov.T @ Sinv @ innov)
-                ll_acc += -0.5 * (m2_ll + logdet + 2*self._LOG2PI)
+                ll_acc += -0.5 * (m2_ll + logdet + 2*math.log(2.0*math.pi))
 
-            # births / tentatives (rate-adaptive aging)
+            # births / tentatives
             new_idx=[i for i in range(len(OBS)) if i not in used_obs]
             if new_idx:
                 T=part["tentative"][name]
@@ -481,16 +493,28 @@ class FastSLAMCore(Node):
                 stale_horizon = 5.0*(self._rx_dt_ema if self._rx_dt_ema else 0.6)
                 for (p,t0,tlast,cnt,SR) in T:
                     if (t_z-t0)<=self.promote_window and cnt>=self.promote_count:
-                        MU,S,seen,tt=self._promote(MU,S,seen,tt,p,SR, v, yr, dt_pose, pose_p)
+                        MU,S,seen,tt=self._promote(MU,S,seen,tt,p,SR, v, yr, dt_pose, pose_p, t_z)
                     else:
                         if (t_z-tlast)<stale_horizon: keep.append((p,t0,tlast,cnt,SR))
                 part["tentative"][name]=keep
 
-            # write back + dedup + age cull
+            # write back
             bank["mu"]=MU; bank["Sigma"]=S; bank["seen"]=seen; bank["t"]=tt
             self._dedup_bank(bank)
-            if bank["mu"].shape[0]>0:
+
+            # aging: only if not persistent OR not yet credible
+            if bank["mu"].shape[0]>0 and (not self.persist):
                 alive = (t_z - bank["t"]) <= self.max_age
+                bank["mu"]    = bank["mu"][alive]
+                bank["Sigma"] = bank["Sigma"][alive]
+                bank["seen"]  = bank["seen"][alive]
+                bank["t"]     = bank["t"][alive]
+            elif bank["mu"].shape[0]>0:
+                # if persistent: never drop if seen >= threshold
+                keep = (bank["seen"] >= self.persist_seen_th)
+                # still allow dropping very flaky singles older than max_age
+                maybe = (t_z - bank["t"]) <= self.max_age
+                alive = np.logical_or(keep, maybe)
                 bank["mu"]    = bank["mu"][alive]
                 bank["Sigma"] = bank["Sigma"][alive]
                 bank["seen"]  = bank["seen"][alive]
@@ -500,7 +524,7 @@ class FastSLAMCore(Node):
             return math.log(self.like_floor)
         return ll_acc
 
-    def _promote(self, MU, S, seen, tt, p_world, Rw_meas, v, yr, dt, pose_p):
+    def _promote(self, MU, S, seen, tt, p_world, Rw_meas, v, yr, dt, pose_p, t_now):
         x_p,y_p,_ = pose_p
         r = float(np.linalg.norm(p_world - np.array([x_p,y_p])))
         R_init = self._inflate_R(Rw_meas, v, yr, dt, r)
@@ -520,7 +544,7 @@ class FastSLAMCore(Node):
                 H = np.eye(2)
                 S[idx_best] = spd_joseph_update(S[idx_best], H, R_init, K)
                 seen[idx_best] += 1
-                tt[idx_best] = tt[idx_best]  # keep latest timestamp or set externally if needed
+                tt[idx_best] = t_now
                 return MU,S,seen,tt
             # block births too close to existing
             for i in range(MU.shape[0]):
@@ -531,13 +555,13 @@ class FastSLAMCore(Node):
             MU = p_world.reshape(1,2)
             S  = R_init.reshape(1,2,2)
             seen = np.array([1],int)
-            tt = np.array([self.last_cone_ts],float)
+            tt = np.array([t_now],float)
             return MU,S,seen,tt
 
         MU = np.vstack([MU, p_world.reshape(1,2)])
         S  = np.vstack([S, R_init.reshape(1,2,2)])
         seen = np.concatenate([seen, np.array([1],int)])
-        tt = np.concatenate([tt, np.array([self.last_cone_ts],float)])
+        tt = np.concatenate([tt, np.array([t_now],float)])
         return MU,S,seen,tt
 
     def _dedup_bank(self, bank):
@@ -558,10 +582,8 @@ class FastSLAMCore(Node):
             for k in cluster:
                 try: Sk_inv = np.linalg.inv(S[k])
                 except np.linalg.LinAlgError: Sk_inv = np.linalg.pinv(S[k])
-                Info += Sk_inv
-                Iu += Sk_inv @ MU[k]
-                ssum += seen[k]
-                tmax = max(tmax, tt[k])
+                Info += Sk_inv; Iu += Sk_inv @ MU[k]
+                ssum += seen[k]; tmax = max(tmax, tt[k])
             try: Pm = np.linalg.inv(Info)
             except np.linalg.LinAlgError: Pm = np.linalg.pinv(Info)
             mum = Pm @ Iu
@@ -569,12 +591,73 @@ class FastSLAMCore(Node):
             merged_S.append(Pm.reshape(1,2,2))
             merged_seen.append(int(ssum))
             merged_tt.append(float(tmax))
-        # Use lengths of merged lists, NOT old MU
         bank["mu"]   = np.vstack(merged_mu) if merged_mu else np.zeros((0,2))
         bank["Sigma"]= np.vstack(merged_S)  if merged_S  else np.zeros((0,2,2))
         bank["seen"] = np.array(merged_seen, dtype=int) if merged_seen else np.zeros((0,), dtype=int)
         bank["t"]    = np.array(merged_tt, dtype=float) if merged_tt else np.zeros((0,), dtype=float)
 
+    # -------- persistent global map accumulation --------
+    def _accumulate_global_map(self, best, t_now):
+        for name in ("blue","yellow","orange","big"):
+            gm = self.global_map[name]
+            MU = best["maps"][name]["mu"]; S = best["maps"][name]["Sigma"]
+            if MU.shape[0]==0: continue
+            if gm["mu"].shape[0]==0:
+                gm["mu"]=MU.copy(); gm["S"]=S.copy()
+                gm["seen"]=np.maximum(1, best["maps"][name]["seen"].copy())
+                gm["t"]=np.full((MU.shape[0],), t_now, float)
+                continue
+            # fuse each best LM into global set via information fusion
+            mu_g, S_g, seen_g, t_g = gm["mu"], gm["S"], gm["seen"], gm["t"]
+            for i in range(MU.shape[0]):
+                mu_i = MU[i]; Si = S[i]
+                # find closest global by Mahalanobis
+                d_best, j_best = 1e18, -1
+                for j in range(mu_g.shape[0]):
+                    d = mahal2(mu_g[j], S_g[j], mu_i, Si)
+                    if d < d_best: d_best, j_best = d, j
+                if d_best < self.merge_m2_gate:
+                    # info fusion
+                    try: Sg_inv = np.linalg.inv(S_g[j_best])
+                    except np.linalg.LinAlgError: Sg_inv = np.linalg.pinv(S_g[j_best])
+                    try: Si_inv = np.linalg.inv(Si)
+                    except np.linalg.LinAlgError: Si_inv = np.linalg.pinv(Si)
+                    Info = Sg_inv + Si_inv
+                    try: Pm = np.linalg.inv(Info)
+                    except np.linalg.LinAlgError: Pm = np.linalg.pinv(Info)
+                    mu = Pm @ (Sg_inv @ mu_g[j_best] + Si_inv @ mu_i)
+                    mu_g[j_best] = mu.reshape(2); S_g[j_best] = Pm
+                    seen_g[j_best] = min(32767, seen_g[j_best] + 1)
+                    t_g[j_best] = t_now
+                else:
+                    mu_g = np.vstack([mu_g, mu_i.reshape(1,2)])
+                    S_g  = np.vstack([S_g,  Si.reshape(1,2,2)])
+                    seen_g = np.concatenate([seen_g, np.array([1],int)])
+                    t_g = np.concatenate([t_g, np.array([t_now],float)])
+            gm["mu"], gm["S"], gm["seen"], gm["t"] = mu_g, S_g, seen_g, t_g
+
+    def _publish_map_persistent(self, t_s):
+        msg = ConeArrayWithCovariance()
+        msg.header.stamp = rclpy.time.Time(seconds=t_s).to_msg()
+        msg.header.frame_id = "map"
+        def bank(mu, Sigma):
+            out = []
+            for i in range(mu.shape[0]):
+                cov = 0.5*(Sigma[i] + Sigma[i].T)
+                c = ConeWithCovariance()
+                c.point = Point(x=float(mu[i,0]), y=float(mu[i,1]), z=0.0)
+                c.covariance = [float(cov[0,0]), float(cov[0,1]),
+                                float(cov[1,0]), float(cov[1,1])]
+                out.append(c)
+            return out
+        gm = self.global_map
+        msg.blue_cones       = bank(gm["blue"]["mu"],   gm["blue"]["S"])
+        msg.yellow_cones     = bank(gm["yellow"]["mu"], gm["yellow"]["S"])
+        msg.orange_cones     = bank(gm["orange"]["mu"], gm["orange"]["S"])
+        msg.big_orange_cones = bank(gm["big"]["mu"],    gm["big"]["S"])
+        self.pub_map.publish(msg)
+
+    # -------------------- PF boilerplate --------------------
     def _resample_systematic_deep(self):
         N=self.Np
         positions=(np.arange(N)+np.random.uniform())/N
@@ -602,27 +685,6 @@ class FastSLAMCore(Node):
             new_particles.append(dst)
         self.particles=new_particles
         self.weights[:]=1.0/N
-
-    def _publish_map(self,best,t_s):
-        msg = ConeArrayWithCovariance()
-        msg.header.stamp = rclpy.time.Time(seconds=t_s).to_msg()
-        msg.header.frame_id = "map"
-        def bank(mu, Sigma):
-            out = []
-            for i in range(mu.shape[0]):
-                cov = 0.5*(Sigma[i] + Sigma[i].T)
-                c = ConeWithCovariance()
-                c.point = Point(x=float(mu[i,0]), y=float(mu[i,1]), z=0.0)
-                c.covariance = [float(cov[0,0]), float(cov[0,1]),
-                                float(cov[1,0]), float(cov[1,1])]
-                out.append(c)
-            return out
-        maps = best["maps"]
-        msg.blue_cones       = bank(maps["blue"]["mu"],   maps["blue"]["Sigma"])
-        msg.yellow_cones     = bank(maps["yellow"]["mu"], maps["yellow"]["Sigma"])
-        msg.orange_cones     = bank(maps["orange"]["mu"], maps["orange"]["Sigma"])
-        msg.big_orange_cones = bank(maps["big"]["mu"],    maps["big"]["Sigma"])
-        self.pub_map.publish(msg)
 
 # -------------------- main --------------------
 def main():
