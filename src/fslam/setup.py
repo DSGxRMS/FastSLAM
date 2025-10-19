@@ -27,7 +27,9 @@ setup(
             'plot = fslam.fslam_view:main',
             'fslam_pred = fslam.fslam_pred:main',
             'map = fslam.mapper:main',
-            'map_plot = fslam.plot_map:main'
+            'map_plot = fslam.plot_map:main',
+            'fslam_viz = fslam.fslam_viz:main',
+            'fslam_core = fslam.fslam_core:main',
         ],
     },
 )

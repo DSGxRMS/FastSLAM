@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'skidpad = test_ctrls.skidpad:main',
+            'controls = test_ctrls.try_path:main'
         ],
     },
 )
