@@ -29,6 +29,7 @@ Access nodes through this:
 ```ros2 run pathp path_plot```
 
 
+* Added a ros bag for controls to run each time. Works on small_track map
 
 * Mapping Codes yet to be finished. So far map exists if driven correctly and on track. Unnecessary turns blow the dynamic gating algorithm
 

@@ -118,8 +118,8 @@ class FastSLAMCore(Node):
         super().__init__("fastslam_core", automatically_declare_parameters_from_overrides=True)
 
         # topics
-        self.declare_parameter("topics.odom_in","/odometry_integration/car_state")
-        # self.declare_parameter("topics.odom_in","/ground_truth/odom")
+        # self.declare_parameter("topics.odom_in","/odometry_integration/car_state")
+        self.declare_parameter("topics.odom_in","/ground_truth/odom")
         self.declare_parameter("topics.cones","/ground_truth/cones")
         self.declare_parameter("topics.odom_out","/fastslam/odom")
         self.declare_parameter("topics.map_out","/fastslam/map_cones")
