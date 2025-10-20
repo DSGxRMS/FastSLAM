@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 # fslam_core.py
 #
-# FastSLAM (PF + per-particle landmark EKFs) with JCBB (color-strict),
-# confidence-based retention, JCBB fallback (greedy), and early map publish.
+# FastSLAM (PF + per-particle landmark EKFs) with:
+#  - JCBB (color-strict) + greedy fallback
+#  - Adaptive gating (context + residual-driven)
+#  - Confidence-based retention + early map publish
+#  - Drift nudging (small Gauss-Newton step on Δ per particle)
 #
 # Inputs:
-#   /odometry_integration/car_state   (nav_msgs/Odometry)         -> proposal (swap to GT via param)
-#   /ground_truth/cones               (eufs_msgs/ConeArrayWithCovariance) -> detections (BASE by default)
+#   /odometry_integration/car_state (nav_msgs/Odometry)  -> proposal  (swap to GT via param)
+#   /ground_truth/cones             (eufs_msgs/ConeArrayWithCovariance) -> detections (BASE by default)
 #
 # Outputs (for your visualizer):
-#   /fastslam/odom        (nav_msgs/Odometry)                     -> corrected odom at input odom rate
-#   /fastslam/map_cones   (eufs_msgs/ConeArrayWithCovariance)     -> best-particle landmarks
-#   /fastslam/pose2d      (geometry_msgs/Pose2D)
+#   /fastslam/odom       (nav_msgs/Odometry)
+#   /fastslam/map_cones  (eufs_msgs/ConeArrayWithCovariance)
+#   /fastslam/pose2d     (geometry_msgs/Pose2D)
 #
 import math
 import time
@@ -118,7 +121,7 @@ class FastSLAMCore(Node):
 
         # ---- DA / measurement ----
         self.declare_parameter("detections_frame", "base")   # "base" (car sees) or "world"
-        self.declare_parameter("chi2_gate_2d", 11.83)        # ~99% for 2 dof
+        self.declare_parameter("chi2_gate_2d", 11.83)        # ~99% for 2 dof (base gate)
         self.declare_parameter("joint_sig", 0.95)
         self.declare_parameter("joint_relax", 1.4)
         self.declare_parameter("min_k_for_joint", 3)
@@ -131,7 +134,7 @@ class FastSLAMCore(Node):
         self.declare_parameter("max_pairs_print", 6)
 
         # ---- PF ----
-        self.declare_parameter("pf.num_particles", 250)
+        self.declare_parameter("pf.num_particles", 400)
         self.declare_parameter("pf.resample_neff_ratio", 0.5)
         self.declare_parameter("pf.process_std_xy_m", 0.02)
         self.declare_parameter("pf.process_std_yaw_rad", 0.002)
@@ -142,7 +145,7 @@ class FastSLAMCore(Node):
 
         # ---- Birth / Promotion / Deletion ----
         self.declare_parameter("birth.single_gate_sig", 0.95)
-        self.declare_parameter("promotion.k_in_n", [2, 3])    # we use only k (distinct hits >= k)
+        self.declare_parameter("promotion.k_in_n", [2, 3])    # use only k (distinct hits >= k)
         self.declare_parameter("promotion_min_dt_s", 0.25)
         self.declare_parameter("delete.cov_trace_max", 1.0)
 
@@ -160,13 +163,28 @@ class FastSLAMCore(Node):
         self.declare_parameter("jcbb.max_obs_total", 9)
         self.declare_parameter("jcbb.max_obs_per_color", 3)
         self.declare_parameter("jcbb.cand_per_obs", 5)
-        self.declare_parameter("jcbb.time_budget_ms", 200.0)
-        self.declare_parameter("jcbb.crop_radius_m", 30.0)
+        self.declare_parameter("jcbb.time_budget_ms", 700.0)
+        self.declare_parameter("jcbb.crop_radius_m", 25.0)
         self.declare_parameter("log.jcbb", True)
 
-        # ---- Map publish thresholds (NEW) ----
+        # ---- Map publish thresholds ----
         self.declare_parameter("map.publish_min_conf", 0.15)
         self.declare_parameter("map.publish_min_hits", 1)
+
+        # ---- Adaptive gating params (NEW) ----
+        self.declare_parameter("gate.adapt_enable", True)
+        self.declare_parameter("gate.scale_min", 0.6)
+        self.declare_parameter("gate.scale_max", 2.5)
+        self.declare_parameter("gate.target_cands", 2.0)     # aim ~2 candidates per obs
+        self.declare_parameter("gate.k_pos", 0.10)            # per-meter scaling of chi²
+        self.declare_parameter("gate.k_yaw", 0.50)            # per-rad scaling of chi²
+
+        # ---- Drift nudge (NEW) ----
+        self.declare_parameter("nudge.enable", True)
+        self.declare_parameter("nudge.gain_xy", 0.20)         # small step on dx,dy
+        self.declare_parameter("nudge.gain_yaw", 0.12)        # small step on dθ
+        self.declare_parameter("nudge.max_xy_step", 0.20)     # clamp per update
+        self.declare_parameter("nudge.max_yaw_step", 5.0)     # deg clamp per update
 
         # ---- read params ----
         gp = self.get_parameter
@@ -186,7 +204,7 @@ class FastSLAMCore(Node):
         )
 
         self.detections_frame = str(gp("detections_frame").value).lower()
-        self.chi2_gate = float(gp("chi2_gate_2d").value)
+        self.chi2_gate_base = float(gp("chi2_gate_2d").value)
         self.joint_sig = float(gp("joint_sig").value)
         self.joint_relax = float(gp("joint_relax").value)
         self.min_k_for_joint = int(gp("min_k_for_joint").value)
@@ -230,6 +248,19 @@ class FastSLAMCore(Node):
 
         self.map_pub_conf = float(gp("map.publish_min_conf").value)
         self.map_pub_hits = int(gp("map.publish_min_hits").value)
+
+        self.adapt_gate    = bool(gp("gate.adapt_enable").value)
+        self.gate_min      = float(gp("gate.scale_min").value)
+        self.gate_max      = float(gp("gate.scale_max").value)
+        self.gate_target   = float(gp("gate.target_cands").value)
+        self.gate_k_pos    = float(gp("gate.k_pos").value)
+        self.gate_k_yaw    = float(gp("gate.k_yaw").value)
+
+        self.nudge_enable  = bool(gp("nudge.enable").value)
+        self.nudge_xy      = float(gp("nudge.gain_xy").value)
+        self.nudge_yaw     = float(gp("nudge.gain_yaw").value)
+        self.nudge_max_xy  = float(gp("nudge.max_xy_step").value)
+        self.nudge_max_yaw = math.radians(float(gp("nudge.max_yaw_step").value))  # deg->rad
 
         # ---- state ----
         np.random.seed(self.seed)
@@ -383,6 +414,15 @@ class FastSLAMCore(Node):
         # PF predict on Δ
         self._pf_predict()
 
+        # --------- Adaptive chi² gate this frame ---------
+        chi2_gate = self.chi2_gate_base
+        if self.adapt_gate:
+            drift_pos = math.hypot(self.delta_hat[0], self.delta_hat[1])
+            drift_yaw = abs(self.delta_hat[2])
+            scale = 1.0 + self.gate_k_pos * drift_pos + self.gate_k_yaw * drift_yaw
+            scale = min(max(scale, self.gate_min), self.gate_max)
+            chi2_gate *= scale
+
         new_w = np.zeros(self.Np, float)
 
         t_start = time.perf_counter()
@@ -392,12 +432,29 @@ class FastSLAMCore(Node):
             Rc = rot2d(yaw_c)
             pc = np.array([x_o + dx, y_o + dy], float)
 
-            # ---------- Candidates (color-strict) ----------
+            # ---------- build candidates (color-strict) with pre-crop + cap ----------
             cands: List[List[Tuple[int, float]]] = []
-            cand_total = 0
+            total_cands = 0
+            # dynamic fine-tune of gate based on local overload (start with frame gate)
+            gate_eff = chi2_gate
+
             for (pb, Sb, color) in obs:
                 pw_pred = pc + Rc @ pb
                 r = float(np.linalg.norm(pb))
+                # distance crop to shrink LM set early
+                # collect LMs of same color near pw_pred
+                near_idx = []
+                if p.lms:
+                    # quick distance filter
+                    for j, lm in enumerate(p.lms):
+                        if lm.color != color:
+                            continue
+                        if (abs(lm.mean[0] - pw_pred[0]) > self.crop_radius_m) or (abs(lm.mean[1] - pw_pred[1]) > self.crop_radius_m):
+                            continue
+                        if (lm.mean - pw_pred) @ (lm.mean - pw_pred) > (self.crop_radius_m ** 2):
+                            continue
+                        near_idx.append(j)
+
                 trans_var = self.alpha * (v**2) * (dt_pose**2)
                 lat_var   = self.beta  * (yawrate**2) * (dt_pose**2) * (r**2)
                 S0_w = Rc @ Sb @ Rc.T
@@ -409,17 +466,29 @@ class FastSLAMCore(Node):
                 except np.linalg.LinAlgError: S_inv = np.linalg.pinv(Sinf)
 
                 lst = []
-                for j, lm in enumerate(p.lms):
-                    if lm.color != color:
-                        continue
+                for j in near_idx:
+                    lm = p.lms[j]
                     innov = pw_pred - lm.mean
                     m2 = float(innov.T @ S_inv @ innov)
-                    if m2 <= self.chi2_gate:
+                    if m2 <= gate_eff:
                         lst.append((j, m2))
+
+                # Cap #cands per obs for stable JCBB time
                 if lst:
                     lst.sort(key=lambda t: t[1])
-                cand_total += len(lst)
+                    if self.cand_per_obs > 0:
+                        lst = lst[:self.cand_per_obs]
+                total_cands += len(lst)
                 cands.append(lst)
+
+            # Fine adapt: if avg cands too high or zero, nudge gate_eff and rebuild once fast
+            avg_c = (total_cands / max(1, len(obs)))
+            if self.adapt_gate:
+                if avg_c > (self.gate_target * 1.5):
+                    gate_eff = max(self.gate_min * self.chi2_gate_base, gate_eff * 0.8)
+                elif avg_c < 0.5:
+                    gate_eff = min(self.gate_max * self.chi2_gate_base, gate_eff * 1.25)
+                # quick one-pass tighten/loosen (no full rebuild to keep time bounded)
 
             # ---------- JCBB with timeout ----------
             order = sorted(range(len(obs)), key=lambda k: len(cands[k]) if cands[k] else 9999)
@@ -427,12 +496,10 @@ class FastSLAMCore(Node):
             best_pairs: List[Tuple[int, int, float]] = []
             best_K = 0
             used = set()
-            timed_out = False
 
             def dfs(idx, cur_pairs, cur_sum):
-                nonlocal best_pairs, best_K, timed_out
+                nonlocal best_pairs, best_K
                 if (time.perf_counter() - t_start) > self.jcbb_budget_s:
-                    timed_out = True
                     return
                 cur_K = len(cur_pairs)
                 if cur_K + (len(cands_ord) - idx) < best_K:
@@ -461,7 +528,7 @@ class FastSLAMCore(Node):
 
             dfs(0, [], 0.0)
 
-            # ---------- Fallback: greedy NN if JCBB found none ----------
+            # ---------- Fallback: greedy NN if nothing ----------
             if len(best_pairs) == 0:
                 used_lm = set()
                 for oi in order:
@@ -470,7 +537,7 @@ class FastSLAMCore(Node):
                     lmj, m2 = min(cands[oi], key=lambda t: t[1])
                     if lmj in used_lm:
                         continue
-                    if m2 <= self.chi2_gate:
+                    if m2 <= gate_eff:
                         best_pairs.append((oi, lmj, m2))
                         used_lm.add(lmj)
 
@@ -478,11 +545,10 @@ class FastSLAMCore(Node):
             m2_sum = float(sum(m2 for (_, _, m2) in best_pairs))
             K = len(best_pairs)
             df = 2 * max(1, K)
-            gate = self.joint_relax * chi2_quantile(df, self.joint_sig)
-            have_valid = (K >= max(2, self.min_k_for_joint) and m2_sum <= gate)
+            gate_joint = self.joint_relax * chi2_quantile(df, self.joint_sig)
+            have_valid = (K >= max(2, self.min_k_for_joint) and m2_sum <= gate_joint)
             like = self.like_floor if not have_valid else max(math.exp(-0.5 * m2_sum), self.like_floor)
-            # allow K=1 to still give some weight (helps early promotion)
-            if K == 1 and m2_sum <= self.chi2_gate:
+            if K == 1 and m2_sum <= gate_eff:  # allow early small weight from singles
                 like = max(math.exp(-0.5 * m2_sum), self.like_floor)
             new_w[i] = p.weight * like
 
@@ -494,6 +560,8 @@ class FastSLAMCore(Node):
                     lm.conf *= decay
 
             # ---------- EKF updates + promotion/retention ----------
+            innovations_world = []   # for drift nudge
+            yaw_terms = []           # (pb_world, innov_world)
             for (oi, lmj, _) in best_pairs:
                 pb, Sb, color = obs[oi]
                 pw_pred = pc + Rc @ pb
@@ -508,6 +576,10 @@ class FastSLAMCore(Node):
                 innov = pw_pred - lm.mean
                 lm.mean = lm.mean + Kmat @ innov
                 lm.cov  = (np.eye(2) - Kmat) @ P
+
+                # collect for nudging
+                innovations_world.append(innov)
+                yaw_terms.append((Rc @ pb, innov))
 
                 lm.conf = (1.0 - self.conf_beta) * lm.conf + self.conf_beta * 1.0
                 if (lm.last_hit_t < 0.0) or ((t_z - lm.last_hit_t) >= self.prom_dt_min):
@@ -571,6 +643,30 @@ class FastSLAMCore(Node):
                                           distinct_hits=1,
                                           conf=self.conf_beta,
                                           retained=False))
+
+            # ---------- drift nudge on Δ (small, bounded) ----------
+            if self.nudge_enable and len(innovations_world) > 0:
+                innov_mean = np.mean(np.vstack(innovations_world), axis=0)  # world xy
+                step_xy = -self.nudge_xy * innov_mean
+                # yaw step via cross((Rc@pb), innov) / ||pb||^2 averaged
+                yaw_accum = 0.0; denom = 0.0
+                for pwb, inn in yaw_terms:
+                    r2 = float(np.dot(pwb, pwb)) + 1e-6
+                    # For small angles, innovation ~ dθ * [ -y_b, x_b ], use z-cross:
+                    yaw_accum += (pwb[0]*inn[1] - pwb[1]*inn[0]) / r2
+                    denom += 1.0
+                step_yaw = -self.nudge_yaw * (yaw_accum / max(1.0, denom))
+
+                # clamp
+                nrm = float(np.linalg.norm(step_xy))
+                if nrm > self.nudge_max_xy:
+                    step_xy *= (self.nudge_max_xy / nrm)
+                if abs(step_yaw) > self.nudge_max_yaw:
+                    step_yaw = math.copysign(self.nudge_max_yaw, step_yaw)
+
+                p.delta[0] += float(step_xy[0])
+                p.delta[1] += float(step_xy[1])
+                p.delta[2] = wrap(p.delta[2] + float(step_yaw))
 
             # ---------- deletion ----------
             keep = []

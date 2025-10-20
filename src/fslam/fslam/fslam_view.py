@@ -39,7 +39,7 @@ class LivePlotNode(Node):
         super().__init__("live_plotter", automatically_declare_parameters_from_overrides=True)
 
         # Topics (override via ROS params if needed)
-        self.declare_parameter("topics.corr", "/pf_localizer/odom_corrected")     # PF corrected
+        self.declare_parameter("topics.corr", "/fastslam/odom")     # PF corrected
         self.declare_parameter("topics.gt",   "/ground_truth/odom")               # GT
         self.declare_parameter("topics.ekf",  "/odometry_integration/car_state")  # Optional EKF. Set "" to disable.
         self.declare_parameter("plot.hz", 10.0)
