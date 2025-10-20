@@ -1,760 +1,709 @@
 #!/usr/bin/env python3
-import math, bisect
+# fslam_core.py
+#
+# FastSLAM (PF + per-particle landmark EKFs) with JCBB (color-strict),
+# confidence-based retention, JCBB fallback (greedy), and early map publish.
+#
+# Inputs:
+#   /odometry_integration/car_state   (nav_msgs/Odometry)         -> proposal (swap to GT via param)
+#   /ground_truth/cones               (eufs_msgs/ConeArrayWithCovariance) -> detections (BASE by default)
+#
+# Outputs (for your visualizer):
+#   /fastslam/odom        (nav_msgs/Odometry)                     -> corrected odom at input odom rate
+#   /fastslam/map_cones   (eufs_msgs/ConeArrayWithCovariance)     -> best-particle landmarks
+#   /fastslam/pose2d      (geometry_msgs/Pose2D)
+#
+import math
+import time
+import bisect
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
 from collections import deque
+
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy, QoSDurabilityPolicy
 from rclpy.time import Time as RclTime
+from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy, QoSDurabilityPolicy
 
 from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Pose, PoseWithCovariance, Twist, TwistWithCovariance, Point, Quaternion, Vector3, Pose2D
 from eufs_msgs.msg import ConeArrayWithCovariance, ConeWithCovariance
-from geometry_msgs.msg import Pose2D, Pose, PoseWithCovariance, Twist, TwistWithCovariance, Point, Quaternion, Vector3
 
-# -------------------- math utils --------------------
-def wrap(a): return (a + math.pi) % (2*math.pi) - math.pi
-def rot2d(th):
-    c,s=math.cos(th),math.sin(th)
-    return np.array([[c,-s],[s,c]],float)
-def yaw_from_quat(x,y,z,w):
-    siny_cosp=2*(w*z+x*y); cosy_cosp=1-2*(y*y+z*z)
-    return math.atan2(siny_cosp,cosy_cosp)
-def quat_from_yaw(yaw):
-    q=Quaternion(); q.x=0.0; q.y=0.0; q.z=math.sin(yaw/2.0); q.w=math.cos(yaw/2.0)
+
+# --------------------- helpers ---------------------
+def wrap(a: float) -> float:
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+def rot2d(th: float) -> np.ndarray:
+    c, s = math.cos(th), math.sin(th)
+    return np.array([[c, -s], [s, c]], float)
+
+def yaw_from_quat(x, y, z, w) -> float:
+    siny_cosp = 2 * (w * z + x * y)
+    cosy_cosp = 1 - 2 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+def quat_from_yaw(yaw: float) -> Quaternion:
+    q = Quaternion()
+    q.x = 0.0; q.y = 0.0
+    q.z = math.sin(yaw / 2.0); q.w = math.cos(yaw / 2.0)
     return q
 
-def _norm_ppf(p):
-    if p<=0.0: return -float('inf')
-    if p>=1.0: return float('inf')
-    a1=-3.969683028665376e+01; a2=2.209460984245205e+02; a3=-2.759285104469687e+02
-    a4=1.383577518672690e+02; a5=-3.066479806614716e+01; a6=2.506628277459239e+00
-    b1=-5.447609879822406e+01; b2=1.615858368580409e+02; b3=-1.556989798598866e+02
-    b4=6.680131188771972e+01; b5=-1.328068155288572e+01
+def _norm_ppf(p: float) -> float:
+    if p <= 0.0: return -float('inf')
+    if p >= 1.0: return  float('inf')
+    a1=-3.969683028665376e+01; a2= 2.209460984245205e+02; a3=-2.759285104469687e+02
+    a4= 1.383577518672690e+02; a5=-3.066479806614716e+01; a6= 2.506628277459239e+00
+    b1=-5.447609879822406e+01; b2= 1.615858368580409e+02; b3=-1.556989798598866e+02
+    b4= 6.680131188771972e+01; b5=-1.328068155288572e+01
     c1=-7.784894002430293e-03; c2=-3.223964580411365e-01; c3=-2.400758277161838e+00
-    c4=-2.549732539343734e+00; c5=4.374664141464968e+00; c6=2.938163982698783e+00
-    d1=7.784695709041462e-03; d2=3.224671290700398e-01; d3=2.445134137142996e+00
-    d4=3.754408661907416e+00
-    plow=0.02425; phigh=1-plow
-    if p<plow:
-        q=math.sqrt(-2*math.log(p))
+    c4=-2.549732539343734e+00; c5= 4.374664141464968e+00; c6= 2.938163982698783e+00
+    d1= 7.784695709041462e-03; d2= 3.224671290700398e-01; d3= 2.445134137142996e+00
+    d4= 3.754408661907416e+00
+    plow  = 0.02425; phigh = 1 - plow
+    if p < plow:
+        q = math.sqrt(-2*math.log(p))
         return (((((c1*q+c2)*q+c3)*q+c4)*q+c5)*q+c6)/((((d1*q+d2)*q+d3)*q+d4)*q+1)
-    if p>phigh:
-        q=math.sqrt(-2*math.log(1-p))
+    if p > phigh:
+        q = math.sqrt(-2*math.log(1-p))
         return -(((((c1*q+c2)*q+c3)*q+c4)*q+c5)*q+c6)/((((d1*q+d2)*q+d3)*q+d4)*q+1)
-    q=p-0.5; r=q*q
+    q = p - 0.5; r = q*q
     return (((((a1*r+a2)*r+a3)*r+a4)*r+a5)*r+a6)*q/(((((b1*r+b2)*r+b3)*r+b4)*r+b5)*r+1)
 
-def chi2_quantile(dof,p):
-    k=max(1,int(dof)); z=_norm_ppf(p)
-    t=1.0-2.0/(9.0*k)+z*math.sqrt(2.0/(9.0*k))
-    return k*(t**3)
+def chi2_quantile(dof: int, p: float) -> float:
+    k = max(1, int(dof))
+    z = _norm_ppf(p)
+    t = 1.0 - 2.0/(9.0*k) + z*math.sqrt(2.0/(9.0*k))
+    return k * (t**3)
 
-def spd_joseph_update(P, H, R, K):
-    I = np.eye(P.shape[0]); A = (I - K @ H)
-    Pn = A @ P @ A.T + K @ R @ K.T
-    Pn = 0.5*(Pn + Pn.T)
-    w,v = np.linalg.eigh(Pn); w = np.clip(w, 1e-9, None)
-    return (v * w) @ v.T
 
-def safe_inv_and_logdet(S):
-    try:
-        Sinv = np.linalg.inv(S)
-        sign, logdet = np.linalg.slogdet(S)
-        if sign <= 0: raise np.linalg.LinAlgError
-    except np.linalg.LinAlgError:
-        Sinv = np.linalg.pinv(S)
-        u,s,vt = np.linalg.svd(S)
-        s = np.clip(s, 1e-12, None)
-        logdet = float(np.sum(np.log(s)))
-    return Sinv, logdet
+# --------------------- landmark + particle data ---------------------
+@dataclass
+class Landmark:
+    mean: np.ndarray              # (2,) world coords in this particle's corrected frame
+    cov: np.ndarray               # (2x2)
+    color: str                    # 'blue' | 'yellow' | 'orange' | 'big'
+    promoted: bool = False
+    last_seen_t: float = -1.0
+    last_hit_t: float = -1.0
+    distinct_hits: int = 0
+    conf: float = 0.0             # EWMA [0..1]
+    retained: bool = False        # never deleted if True
 
-def mahal2(mu_a, S_a, mu_b, S_b):
-    d = (mu_a - mu_b).reshape(2,1)
-    S = S_a + S_b
-    Sinv, _ = safe_inv_and_logdet(S)
-    return float(d.T @ Sinv @ d)
+@dataclass
+class Particle:
+    delta: np.ndarray             # Δ = [dx, dy, dθ]
+    weight: float
+    lms: List[Landmark] = field(default_factory=list)
 
-# -------------------- time-synced odom buffer --------------------
-class OdomBuffer:
-    """Stores pose and bicycle inputs (v, yaw_rate, beta)."""
-    def __init__(self, cap_s=3.0, extrap_cap=0.25):
-        self.buf=deque(); self.cap_s=cap_s; self.extrap_cap=extrap_cap
-        self.latest=np.array([0.0,0.0,0.0],float)
-    def push(self,t,x,y,yaw,v,yr,beta):
-        self.buf.append((t,x,y,yaw,v,yr,beta))
-        tmin=t-self.cap_s
-        while self.buf and self.buf[0][0]<tmin: self.buf.popleft()
-        self.latest[:]=[x,y,yaw]
-    def pose_at(self,tq:float):
-        if not self.buf: return self.latest.copy(), float('inf'), 0.0, 0.0, 0.0
-        times=[it[0] for it in self.buf]
-        i=bisect.bisect_left(times,tq)
-        if i==0:
-            t0,x0,y0,yaw0,v0,yr0,b0=self.buf[0]
-            return np.array([x0,y0,yaw0],float), abs(tq-t0), v0, yr0, b0
-        if i>=len(self.buf):
-            t1,x1,y1,yaw1,v1,yr1,b1=self.buf[-1]
-            dt=max(0.0,min(tq-t1,self.extrap_cap))
-            x=x1 + v1*dt*math.cos(yaw1 + b1)
-            y=y1 + v1*dt*math.sin(yaw1 + b1)
-            yaw=wrap(yaw1 + yr1*dt)
-            return np.array([x,y,yaw],float), abs(tq-t1), v1, yr1, b1
-        t0,x0,y0,yaw0,v0,yr0,b0=self.buf[i-1]
-        t1,x1,y1,yaw1,v1,yr1,b1=self.buf[i]
-        if t1==t0:
-            return np.array([x0,y0,yaw0],float), abs(tq-t0), v0, yr0, b0
-        a=(tq-t0)/(t1-t0)
-        x=x0+a*(x1-x0); y=y0+a*(y1-y0)
-        dyaw=wrap(yaw1-yaw0); yaw=wrap(yaw0+a*dyaw)
-        v=(1-a)*v0+a*v1; yr=(1-a)*yr0+a*yr1
-        db=wrap(b1-b0); beta=wrap(b0+a*db)
-        dt_near=min(abs(tq-t0),abs(tq-t1))
-        return np.array([x,y,yaw],float), dt_near, v, yr, beta
 
-# -------------------- FastSLAM Core --------------------
+# --------------------- FastSLAM core node ---------------------
 class FastSLAMCore(Node):
     def __init__(self):
         super().__init__("fastslam_core", automatically_declare_parameters_from_overrides=True)
 
-        # topics
-        # self.declare_parameter("topics.odom_in","/odometry_integration/car_state")
-        self.declare_parameter("topics.odom_in","/ground_truth/odom")
-        self.declare_parameter("topics.cones","/ground_truth/cones")
-        self.declare_parameter("topics.odom_out","/fastslam/odom")
-        self.declare_parameter("topics.map_out","/fastslam/map_cones")
+        # ---- topics ----
+        self.declare_parameter("topics.pose_in", "/odometry_integration/car_state")   # override to /ground_truth/odom for GT tests
+        # self.declare_parameter("topics.pose_in", "/ground_truth/odom")   # override to /ground_truth/odom for GT tests
+        self.declare_parameter("topics.cones_in", "/ground_truth/cones")
+        self.declare_parameter("topics.odom_out", "/fastslam/odom")
+        self.declare_parameter("topics.map_out", "/fastslam/map_cones")
+        self.declare_parameter("topics.pose2d_out", "/fastslam/pose2d")
 
-        # frames & rate
-        self.declare_parameter("detections_frame","base")  # "base" if cones are in robot frame; "world" if already in map
-        self.declare_parameter("target_cone_hz",25.0)
+        # ---- QoS ----
+        self.declare_parameter("qos.best_effort", True)
+        self.declare_parameter("qos.depth", 200)
 
-        # twist interpretation
-        self.declare_parameter("twist_in_base", True)  # True if twist.linear is already in base_link frame
+        # ---- DA / measurement ----
+        self.declare_parameter("detections_frame", "base")   # "base" (car sees) or "world"
+        self.declare_parameter("chi2_gate_2d", 11.83)        # ~99% for 2 dof
+        self.declare_parameter("joint_sig", 0.95)
+        self.declare_parameter("joint_relax", 1.4)
+        self.declare_parameter("min_k_for_joint", 3)
+        self.declare_parameter("meas_sigma_floor_xy", 0.30)
+        self.declare_parameter("alpha_trans", 0.9)
+        self.declare_parameter("beta_rot", 0.9)
+        self.declare_parameter("target_cone_hz", 25.0)
+        self.declare_parameter("odom_buffer_sec", 2.0)
+        self.declare_parameter("extrapolation_cap_ms", 60.0)
+        self.declare_parameter("max_pairs_print", 6)
 
-        # gates
-        self.declare_parameter("chi2_gate_2d",9.210)   # 99% gate (tune to 7.4–9.2)
-        self.declare_parameter("joint_sig",0.98)
-        self.declare_parameter("joint_relax",1.30)
-        self.declare_parameter("min_k_for_joint",2)
+        # ---- PF ----
+        self.declare_parameter("pf.num_particles", 250)
+        self.declare_parameter("pf.resample_neff_ratio", 0.5)
+        self.declare_parameter("pf.process_std_xy_m", 0.02)
+        self.declare_parameter("pf.process_std_yaw_rad", 0.002)
+        self.declare_parameter("pf.likelihood_floor", 1e-12)
+        self.declare_parameter("pf.init_std_xy_m", 0.0)
+        self.declare_parameter("pf.init_std_yaw_rad", 0.0)
+        self.declare_parameter("seed", 7)
 
-        # noise / search
-        self.declare_parameter("map_crop_m",22.0)
-        self.declare_parameter("meas_sigma_floor_xy",0.45)
-        self.declare_parameter("alpha_trans",0.9)
-        self.declare_parameter("beta_rot",0.9)
+        # ---- Birth / Promotion / Deletion ----
+        self.declare_parameter("birth.single_gate_sig", 0.95)
+        self.declare_parameter("promotion.k_in_n", [2, 3])    # we use only k (distinct hits >= k)
+        self.declare_parameter("promotion_min_dt_s", 0.25)
+        self.declare_parameter("delete.cov_trace_max", 1.0)
 
-        # PF
-        self.declare_parameter("pf.num_particles",300)
-        self.declare_parameter("pf.resample_neff_ratio",0.5)
-        self.declare_parameter("pf.process_std_xy_m",0.02)
-        self.declare_parameter("pf.process_std_yaw_rad",0.002)
+        # ---- Retention / Confidence ----
+        self.declare_parameter("retain.conf_beta", 0.15)
+        self.declare_parameter("retain.decay_hz", 0.05)
+        self.declare_parameter("retain.retain_conf_thr", 0.80)
+        self.declare_parameter("retain.retain_min_hits", 3)
+        self.declare_parameter("retain.retain_cov_tr_max", 0.20)
+        self.declare_parameter("retain.prune_conf_thr", 0.10)
+        self.declare_parameter("retain.max_unseen_s", 30.0)
+        self.declare_parameter("retain.merge_m2_thr", 6.0)
 
-        # birth/merge
-        self.declare_parameter("birth.promote_count",1)
-        self.declare_parameter("birth.promote_window_s",1.0)
-        self.declare_parameter("birth.merge_radius_m",0.8)  # used now as Euclid fence too
-        self.declare_parameter("merge.mahal_gate2",6.0)
-        self.declare_parameter("jcbb.topk",10)
+        # ---- JCBB bounds & logging ----
+        self.declare_parameter("jcbb.max_obs_total", 9)
+        self.declare_parameter("jcbb.max_obs_per_color", 3)
+        self.declare_parameter("jcbb.cand_per_obs", 5)
+        self.declare_parameter("jcbb.time_budget_ms", 200.0)
+        self.declare_parameter("jcbb.crop_radius_m", 30.0)
+        self.declare_parameter("log.jcbb", True)
 
-        # persistence / aging
-        self.declare_parameter("landmark.max_age_s",6.0)
-        self.declare_parameter("landmark.persist", True)
-        self.declare_parameter("landmark.persist_seen_threshold", 3)
+        # ---- Map publish thresholds (NEW) ----
+        self.declare_parameter("map.publish_min_conf", 0.15)
+        self.declare_parameter("map.publish_min_hits", 1)
 
-        self.declare_parameter("like_floor",1e-12)
+        # ---- read params ----
+        gp = self.get_parameter
+        self.pose_topic_in    = str(gp("topics.pose_in").value)
+        self.cones_topic_in   = str(gp("topics.cones_in").value)
+        self.odom_topic_out   = str(gp("topics.odom_out").value)
+        self.map_topic_out    = str(gp("topics.map_out").value)
+        self.pose2d_topic_out = str(gp("topics.pose2d_out").value)
 
-        # resolve
-        gp=self.get_parameter
-        self.topic_odom      = str(gp("topics.odom_in").value)
-        self.topic_cones     = str(gp("topics.cones").value)
-        self.topic_odom_out  = str(gp("topics.odom_out").value)
-        self.topic_map_out   = str(gp("topics.map_out").value)
+        best_effort = bool(gp("qos.best_effort").value)
+        depth = int(gp("qos.depth").value)
+        self.qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=depth,
+            reliability=(QoSReliabilityPolicy.BEST_EFFORT if best_effort else QoSReliabilityPolicy.RELIABLE),
+            durability=QoSDurabilityPolicy.VOLATILE
+        )
 
-        self.frame_mode      = str(gp("detections_frame").value).lower()
-        if self.frame_mode not in ("world","base"): self.frame_mode="base"
+        self.detections_frame = str(gp("detections_frame").value).lower()
+        self.chi2_gate = float(gp("chi2_gate_2d").value)
+        self.joint_sig = float(gp("joint_sig").value)
+        self.joint_relax = float(gp("joint_relax").value)
+        self.min_k_for_joint = int(gp("min_k_for_joint").value)
+        self.sigma0 = float(gp("meas_sigma_floor_xy").value)
+        self.alpha = float(gp("alpha_trans").value)
+        self.beta = float(gp("beta_rot").value)
+        self.target_cone_hz = float(gp("target_cone_hz").value)
+        self.odom_buffer_sec = float(gp("odom_buffer_sec").value)
+        self.extrap_cap = float(gp("extrapolation_cap_ms").value) / 1000.0
+        self.max_pairs_print = int(gp("max_pairs_print").value)
 
-        self.twist_in_base   = bool(gp("twist_in_base").value)
+        self.Np = int(gp("pf.num_particles").value)
+        self.neff_ratio = float(gp("pf.resample_neff_ratio").value)
+        self.p_std_xy = float(gp("pf.process_std_xy_m").value)
+        self.p_std_yaw = float(gp("pf.process_std_yaw_rad").value)
+        self.like_floor = float(gp("pf.likelihood_floor").value)
+        self.init_std_xy = float(gp("pf.init_std_xy_m").value)
+        self.init_std_yaw = float(gp("pf.init_std_yaw_rad").value)
+        self.seed = int(gp("seed").value)
 
-        self.t_cone          = float(gp("target_cone_hz").value)
-        self.gate            = float(gp("chi2_gate_2d").value)
-        self.joint_sig       = float(gp("joint_sig").value)
-        self.joint_relax     = float(gp("joint_relax").value)
-        self.kmin            = int(gp("min_k_for_joint").value)
-        self.crop2           = float(gp("map_crop_m").value)**2
-        self.sigma0          = float(gp("meas_sigma_floor_xy").value)
-        self.a_trans         = float(gp("alpha_trans").value)
-        self.b_rot           = float(gp("beta_rot").value)
+        self.birth_sig = float(gp("birth.single_gate_sig").value)
+        self.prom_k, _ = [int(x) for x in gp("promotion.k_in_n").value]
+        self.prom_dt_min = float(gp("promotion_min_dt_s").value)
+        self.del_covtr = float(gp("delete.cov_trace_max").value)
 
-        self.Np              = int(gp("pf.num_particles").value)
-        self.neff_ratio      = float(gp("pf.resample_neff_ratio").value)
-        self.p_std_xy        = float(gp("pf.process_std_xy_m").value)
-        self.p_std_yaw       = float(gp("pf.process_std_yaw_rad").value)
+        self.conf_beta     = float(gp("retain.conf_beta").value)
+        self.decay_hz      = float(gp("retain.decay_hz").value)
+        self.retain_thr    = float(gp("retain.retain_conf_thr").value)
+        self.retain_hits   = int(gp("retain.retain_min_hits").value)
+        self.retain_cov_tr = float(gp("retain.retain_cov_tr_max").value)
+        self.prune_thr     = float(gp("retain.prune_conf_thr").value)
+        self.max_unseen_s  = float(gp("retain.max_unseen_s").value)
+        self.merge_m2_thr  = float(gp("retain.merge_m2_thr").value)
 
-        self.promote_count   = int(gp("birth.promote_count").value)
-        self.promote_window  = float(gp("birth.promote_window_s").value)
-        self.merge_radius    = float(gp("birth.merge_radius_m").value)
-        self.merge_m2_gate   = float(gp("merge.mahal_gate2").value)
-        self.jcbb_topk       = int(gp("jcbb.topk").value)
+        self.max_obs_total   = int(gp("jcbb.max_obs_total").value)
+        self.max_obs_per_col = int(gp("jcbb.max_obs_per_color").value)
+        self.cand_per_obs    = int(gp("jcbb.cand_per_obs").value)
+        self.jcbb_budget_s   = float(gp("jcbb.time_budget_ms").value) / 1000.0
+        self.crop_radius_m   = float(gp("jcbb.crop_radius_m").value)
+        self.log_jcbb        = bool(gp("log.jcbb").value)
 
-        self.max_age         = float(gp("landmark.max_age_s").value)
-        self.persist         = bool(gp("landmark.persist").value)
-        self.persist_seen_th = int(gp("landmark.persist_seen_threshold").value)
-        self.like_floor      = float(gp("like_floor").value)
+        self.map_pub_conf = float(gp("map.publish_min_conf").value)
+        self.map_pub_hits = int(gp("map.publish_min_hits").value)
 
-        # qos/io
-        qos_in=QoSProfile(history=QoSHistoryPolicy.KEEP_LAST, depth=200,
-                          reliability=QoSReliabilityPolicy.BEST_EFFORT,
-                          durability=QoSDurabilityPolicy.VOLATILE)
-        qos_out=10
-        self.create_subscription(Odometry,self.topic_odom,self.cb_odom,qos_in)
-        self.create_subscription(ConeArrayWithCovariance,self.topic_cones,self.cb_cones,qos_in)
-        self.pub_odom=self.create_publisher(Odometry,self.topic_odom_out,qos_out)
-        self.pub_map =self.create_publisher(ConeArrayWithCovariance,self.topic_map_out,qos_out)
-        self.pub_pose2d=self.create_publisher(Pose2D,"/fastslam/pose2d",qos_out)
+        # ---- state ----
+        np.random.seed(self.seed)
+        self.particles: List[Particle] = [
+            Particle(delta=np.zeros(3, float), weight=1.0 / self.Np) for _ in range(self.Np)
+        ]
+        if self.init_std_xy > 0.0 or self.init_std_yaw > 0.0:
+            for p in self.particles:
+                p.delta[0] = np.random.normal(0.0, self.init_std_xy)
+                p.delta[1] = np.random.normal(0.0, self.init_std_xy)
+                p.delta[2] = np.random.normal(0.0, self.init_std_yaw)
 
-        # state
-        self.odom_buf=OdomBuffer(3.0,0.25)
-        self.pose_ready=False
-        self.last_cone_ts=None
-        self.have_delta=False
-        self.delta_hat=np.zeros(3,float)
-        self.particles=[self._make_particle() for _ in range(self.Np)]
-        self.weights=np.ones(self.Np,float)/self.Np
-        self._LOG2PI = math.log(2.0*math.pi)
+        self.delta_hat = np.zeros(3, float)
+        self.have_pose_feed = False
 
-        # rate adaptation
-        self._rx_dt_ema = None
-        self._ema_alpha = 0.2
-        self._now_s = lambda: self.get_clock().now().nanoseconds * 1e-9
+        # odom buffer: (t, x, y, yaw, v, yawrate)
+        self.odom_buf: deque = deque()
+        self.pose_latest = np.array([0.0, 0.0, 0.0], float)
 
-        # persistent fused map (world frame)
-        self.global_map = {
-            "blue"  : {"mu":np.zeros((0,2)), "S":np.zeros((0,2,2)), "seen":np.zeros((0,),int), "t":np.zeros((0,))},
-            "yellow": {"mu":np.zeros((0,2)), "S":np.zeros((0,2,2)), "seen":np.zeros((0,),int), "t":np.zeros((0,))},
-            "orange": {"mu":np.zeros((0,2)), "S":np.zeros((0,2,2)), "seen":np.zeros((0,),int), "t":np.zeros((0,))},
-            "big"   : {"mu":np.zeros((0,2)), "S":np.zeros((0,2,2)), "seen":np.zeros((0,),int), "t":np.zeros((0,))},
-        }
+        self.last_cone_ts: Optional[float] = None
 
-        self._last_cones_stamp_msg = None
+        # ---- I/O ----
+        self.create_subscription(Odometry, self.pose_topic_in, self.cb_odom, self.qos)
+        self.create_subscription(ConeArrayWithCovariance, self.cones_topic_in, self.cb_cones, self.qos)
+        self.pub_odom = self.create_publisher(Odometry, self.odom_topic_out, 10)
+        self.pub_map  = self.create_publisher(ConeArrayWithCovariance, self.map_topic_out, 10)
+        self.pub_p2d  = self.create_publisher(Pose2D, self.pose2d_topic_out, 10)
 
-    def _make_particle(self):
-        z2=(0,2,2)
-        return {
-            "pose":np.zeros(3,float),
-            "maps":{
-                "blue":{"mu":np.zeros((0,2),float),"Sigma":np.zeros(z2,float),"seen":np.zeros((0,),int),"t":np.zeros((0,),float)},
-                "yellow":{"mu":np.zeros((0,2),float),"Sigma":np.zeros(z2,float),"seen":np.zeros((0,),int),"t":np.zeros((0,),float)},
-                "orange":{"mu":np.zeros((0,2),float),"Sigma":np.zeros(z2,float),"seen":np.zeros((0,),int),"t":np.zeros((0,),float)},
-                "big":{"mu":np.zeros((0,2),float),"Sigma":np.zeros(z2,float),"seen":np.zeros((0,),int),"t":np.zeros((0,),float)},
-            },
-            "tentative":{"blue":[], "yellow":[], "orange":[], "big":[]}
-        }
+        self.get_logger().info(f"[fastslam] up. in:pose={self.pose_topic_in} cones={self.cones_topic_in} | out:odom={self.odom_topic_out} map={self.map_topic_out}")
+        self.get_logger().info(f"[fastslam] Np={self.Np} QoS={'BEST_EFFORT' if best_effort else 'RELIABLE'} detections_frame={self.detections_frame}")
 
-    # -------------------- callbacks --------------------
-    def cb_odom(self,msg:Odometry):
-        t=RclTime.from_msg(msg.header.stamp).nanoseconds*1e-9
-        x=float(msg.pose.pose.position.x); y=float(msg.pose.pose.position.y)
-        q=msg.pose.pose.orientation; yaw=yaw_from_quat(q.x,q.y,q.z,q.w)
-
-        # velocities: either already in base, or rotate world->base
-        vx=float(msg.twist.twist.linear.x); vy=float(msg.twist.twist.linear.y)
-        if self.twist_in_base:
-            v_fwd, v_lat = vx, vy
-        else:
-            v_fwd =  vx*math.cos(yaw) + vy*math.sin(yaw)
-            v_lat = -vx*math.sin(yaw) + vy*math.cos(yaw)
-        v = math.hypot(v_fwd, v_lat)
-        beta = math.atan2(v_lat, v_fwd)
-
-        yr=float(msg.twist.twist.angular.z)
-
-        # store bicycle inputs
-        self.odom_buf.push(t,x,y,yaw,v,yr,beta)
-        self.pose_ready=True
-
-        # publish odom using current delta (raw until first correction)
-        if self.have_delta:
-            dx,dy,dth=self.delta_hat; x_c=x+dx; y_c=y+dy; yaw_c=wrap(yaw+dth)
-        else:
-            x_c=x; y_c=y; yaw_c=yaw
-        od=Odometry()
-        od.header.stamp=msg.header.stamp
-        od.header.frame_id="map"; od.child_frame_id="base_link"
-        od.pose=PoseWithCovariance(); od.twist=TwistWithCovariance()
-        od.pose.pose=Pose(position=Point(x=x_c,y=y_c,z=0.0),orientation=quat_from_yaw(yaw_c))
-        # publish forward speed in base for downstream control
-        od.twist.twist=Twist(linear=Vector3(x=v_fwd, y=0.0, z=0.0),
-                             angular=Vector3(x=0.0,y=0.0,z=yr))
-        self.pub_odom.publish(od)
-        p2=Pose2D(); p2.x=x_c; p2.y=y_c; p2.theta=yaw_c
-        self.pub_pose2d.publish(p2)
-
-    def cb_cones(self,msg:ConeArrayWithCovariance):
-        if not self.pose_ready: return
-        t_z=RclTime.from_msg(msg.header.stamp).nanoseconds*1e-9
-
-        # rate adaptation
-        now = self._now_s()
-        if hasattr(self, "_last_rx"):
-            dt_rx = max(1e-3, now - self._last_rx)
-            self._rx_dt_ema = dt_rx if self._rx_dt_ema is None else \
-                (1 - self._ema_alpha)*self._rx_dt_ema + self._ema_alpha*dt_rx
-        self._last_rx = now
-        self.promote_window = float(np.clip(3.0*(self._rx_dt_ema if self._rx_dt_ema else 1.0), 0.6, 4.0))
-
-        self.last_cone_ts=t_z
-        self._last_cones_stamp_msg = msg.header.stamp
-
-        # odom pose synchronized to t_z
-        od_pose_tz,dt_pose,v_local,yr_local,beta_local=self.odom_buf.pose_at(t_z)
-        dt_pose = 0.0 if not math.isfinite(dt_pose) else dt_pose
-
-        # predict particles to t_z (bicycle)
-        for i in range(self.Np):
-            self.particles[i]["pose"]=self._propose_pose(od_pose_tz, v_local, yr_local, beta_local, dt_pose)
-
-        obs=self._parse_obs(msg)
-        if not any(len(obs[k])>0 for k in obs.keys()): return
-
-        # update & weight
-        ll=np.zeros(self.Np,float)
-        for i in range(self.Np):
-            ll[i]=self._update_particle(self.particles[i],obs,t_z,dt_pose,v_local,yr_local)
-
-        w_new=self.weights*np.exp(ll-np.max(ll))
-        sw=float(np.sum(w_new))
-        self.weights[:] = (1.0/self.Np) if (not math.isfinite(sw) or sw<=0.0) else (w_new/sw)
-
-        # resample
-        neff=1.0/float(np.sum(self.weights*self.weights))
-        if neff<self.neff_ratio*self.Np:
-            self._resample_systematic_deep()
-
-        # best particle
-        bi=int(np.argmax(self.weights))
-        best=self.particles[bi]
-
-        # IMPORTANT: compute delta vs odom_at(t_z), not "latest"
-        self.delta_hat[:]=self._compute_delta(best["pose"], od_pose=od_pose_tz)
-        self.have_delta=True
-
-        # fuse into persistent global map
-        self._accumulate_global_map(best, t_z)
-
-        # publish persistent map
-        self._publish_map_persistent(self._last_cones_stamp_msg)
-
-    # -------------------- core ops --------------------
-    def _compute_delta(self,pose_particle, od_pose):
-        x_p,y_p,yaw_p=pose_particle; x_o,y_o,yaw_o=od_pose
-        return np.array([x_p-x_o, y_p-y_o, wrap(yaw_p-yaw_o)],float)
-
-    def _propose_pose(self,od_pose, v, yr, beta, dt):
-        """Bicycle kinematics using measured v, yaw_rate, and slip beta."""
-        x,y,yaw=od_pose
-        if dt > 0.0:
-            x   += v*dt*math.cos(yaw + beta)
-            y   += v*dt*math.sin(yaw + beta)
-            yaw  = wrap(yaw + yr*dt)
-        # process noise
-        s_xy  = self.p_std_xy  + 0.1*abs(v)*max(dt,1e-3)
-        s_yaw = self.p_std_yaw + 0.05*abs(yr)*max(dt,1e-3)
-        x   += np.random.normal(0.0,s_xy)
-        y   += np.random.normal(0.0,s_xy)
-        yaw  = wrap(yaw + np.random.normal(0.0,s_yaw))
-        return np.array([x,y,yaw],float)
-
-    def _parse_obs(self,msg):
-        out={"blue":[], "yellow":[], "orange":[], "big":[]}
-        def arr_append(name, c):
-            R=np.array([[c.covariance[0],c.covariance[1]],[c.covariance[2],c.covariance[3]]],float)
-            p=np.array([float(c.point.x), float(c.point.y)],float)
-            if not np.isfinite(p).all(): return
-            if not np.isfinite(R).all(): return
-            R = 0.5*(R+R.T)
-            w,v = np.linalg.eigh(R); w = np.clip(w, 1e-6, None); R = (v*w)@v.T
-            out[name].append((p, R))
-        for c in msg.blue_cones: arr_append("blue", c)
-        for c in msg.yellow_cones: arr_append("yellow", c)
-        for c in msg.orange_cones: arr_append("orange", c)
-        for c in msg.big_orange_cones: arr_append("big", c)
-        return out
-
-    def _inflate_R(self, R_meas_world, v, yr, dt, r):
-        add = self.a_trans*(v**2)*(dt**2) + self.b_rot*(yr**2)*(dt**2)*(r**2)
-        R_eff = R_meas_world + np.diag([self.sigma0**2, self.sigma0**2]) + add*np.eye(2)
-        R_eff = 0.5*(R_eff + R_eff.T)
-        w,vv = np.linalg.eigh(R_eff); w = np.clip(w, 1e-9, None)
-        return (vv * w) @ vv.T
-
-    # -------------------- JCBB DA --------------------
-    def _jcbb(self, OBS, MU, S, pose_p, dt_pose, v, yr, _crop2_unused):
-        if MU.shape[0]==0 or len(OBS)==0: return []
-        x_p,y_p,yaw_p=pose_p
-        pose_xy=np.array([x_p,y_p])
-        if self.frame_mode == "base": Rwb=rot2d(yaw_p)
-
-        # Convert obs to world + inflate cov
-        obs_world=[]
-        for (z, Rm) in OBS:
-            if self.frame_mode=="base":
-                pw = pose_xy + Rwb @ z; Rw = Rwb @ Rm @ Rwb.T
+    # -------------------- odom buffer helpers --------------------
+    def _pose_at(self, t_query: float):
+        if not self.odom_buf:
+            return self.pose_latest.copy(), float('inf'), 0.0, 0.0
+        times = [it[0] for it in self.odom_buf]
+        idx = bisect.bisect_left(times, t_query)
+        if idx == 0:
+            t0, x0, y0, yaw0, v0, yr0 = self.odom_buf[0]
+            return np.array([x0, y0, yaw0], float), abs(t_query - t0), v0, yr0
+        if idx >= len(self.odom_buf):
+            t1, x1, y1, yaw1, v1, yr1 = self.odom_buf[-1]
+            dt = t_query - t1
+            dt_c = max(0.0, min(dt, self.extrap_cap))
+            if abs(yr1) < 1e-3:
+                x = x1 + v1 * dt_c * math.cos(yaw1)
+                y = y1 + v1 * dt_c * math.sin(yaw1)
+                yaw = wrap(yaw1)
             else:
-                pw = z.copy(); Rw = Rm.copy()
-            r = float(np.linalg.norm(pw - pose_xy))
-            R_eff = self._inflate_R(Rw, v, yr, dt_pose, r)
-            obs_world.append((pw,R_eff))
+                x = x1 + (v1 / yr1) * (math.sin(yaw1 + yr1 * dt_c) - math.sin(yaw1))
+                y = y1 - (v1 / yr1) * (math.cos(yaw1 + yr1 * dt_c) - math.cos(yaw1))
+                yaw = wrap(yaw1 + yr1 * dt_c)
+            return np.array([x, y, yaw], float), abs(dt), v1, yr1
+        t0, x0, y0, yaw0, v0, yr0 = self.odom_buf[idx - 1]
+        t1, x1, y1, yaw1, v1, yr1 = self.odom_buf[idx]
+        if t1 == t0:
+            return np.array([x0, y0, yaw0], float), abs(t_query - t0), v0, yr0
+        a = (t_query - t0) / (t1 - t0)
+        x = x0 + a * (x1 - x0)
+        y = y0 + a * (y1 - y0)
+        dyaw = wrap(yaw1 - yaw0); yaw = wrap(yaw0 + a * dyaw)
+        v = (1 - a) * v0 + a * v1
+        yr = (1 - a) * yr0 + a * yr1
+        dt_near = min(abs(t_query - t0), abs(t_query - t1))
+        return np.array([x, y, yaw], float), dt_near, v, yr
 
-        # Crop landmarks by radius
-        remap = None
-        if MU.shape[0] > 0 and math.isfinite(self.crop2) and self.crop2 < float("inf"):
-            d2 = np.sum((MU - pose_xy.reshape(1,2))**2, axis=1)
-            idxs = np.nonzero(d2 <= self.crop2)[0]
-            if idxs.size == 0: return []
-            MU_pref = MU[idxs]; S_pref  = S[idxs]; remap = idxs
-        else:
-            MU_pref = MU; S_pref = S
+    # -------------------- Odometry IN → publish corrected odom at same rate --------------------
+    def cb_odom(self, msg: Odometry):
+        t = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        x = float(msg.pose.pose.position.x)
+        y = float(msg.pose.pose.position.y)
+        q = msg.pose.pose.orientation
+        yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
+        vx = float(msg.twist.twist.linear.x)
+        vy = float(msg.twist.twist.linear.y)
+        v  = math.hypot(vx, vy)
+        yr = float(msg.twist.twist.angular.z)
 
-        # Candidate matches by Mahalanobis
-        cands=[]
-        for (pw, R_eff) in obs_world:
-            cc=[]
-            for mid in range(MU_pref.shape[0]):
-                St = S_pref[mid] + R_eff
-                if not np.isfinite(St).all(): continue
-                Sinv, _ = safe_inv_and_logdet(St)
-                innov = pw - MU_pref[mid]
-                if not np.isfinite(innov).all(): continue
-                m2 = float(innov.T @ Sinv @ innov)
-                if m2 <= self.gate:
-                    real_mid = remap[mid] if remap is not None else mid
-                    cc.append((real_mid, m2, R_eff))
-            if len(cc) > self.jcbb_topk:
-                cc = sorted(cc, key=lambda t: t[1])[:self.jcbb_topk]
-            cands.append(cc)
+        self.pose_latest = np.array([x, y, yaw], float)
+        self.odom_buf.append((t, x, y, yaw, v, yr))
+        tmin = t - self.odom_buffer_sec
+        while self.odom_buf and self.odom_buf[0][0] < tmin:
+            self.odom_buf.popleft()
 
-        order = sorted(range(len(obs_world)), key=lambda i: len(cands[i]) if cands[i] else float("inf"))
-        cands_ord = [cands[i] for i in order]
-        best_pairs=[]; best_K=0; best_sum=1e18; used=set()
-        def dfs(idx,cur,sum_m2):
-            nonlocal best_pairs, best_K, best_sum
-            if idx==len(cands_ord):
-                K=len(cur)
-                if K>best_K or (K==best_K and sum_m2<best_sum):
-                    best_pairs=cur.copy(); best_K=K; best_sum=sum_m2
+        if not self.have_pose_feed:
+            self.have_pose_feed = True
+            self.get_logger().info("[fastslam] proposal feed ready.")
+
+        dx, dy, dth = self.delta_hat
+        yaw_c = wrap(yaw + dth)
+        x_c = x + dx
+        y_c = y + dy
+
+        od = Odometry()
+        od.header.stamp = msg.header.stamp
+        od.header.frame_id = "map"
+        od.child_frame_id = "base_link"
+        od.pose = PoseWithCovariance()
+        od.twist = TwistWithCovariance()
+        od.pose.pose = Pose(position=Point(x=x_c, y=y_c, z=0.0), orientation=quat_from_yaw(yaw_c))
+        od.twist.twist = Twist(
+            linear=Vector3(x=v * math.cos(yaw_c), y=v * math.sin(yaw_c), z=0.0),
+            angular=Vector3(x=0.0, y=0.0, z=yr)
+        )
+        self.pub_odom.publish(od)
+
+        p2 = Pose2D(); p2.x = x_c; p2.y = y_c; p2.theta = yaw_c
+        self.pub_p2d.publish(p2)
+
+        self._publish_map(t)
+
+    # -------------------- Cones IN → per-particle JCBB + EKF map update --------------------
+    def cb_cones(self, msg: ConeArrayWithCovariance):
+        if not self.have_pose_feed:
+            return
+
+        t_z = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        if self.last_cone_ts is not None:
+            if (t_z - self.last_cone_ts) < (1.0 / max(1e-3, self.target_cone_hz)):
                 return
-            # Option 1: skip this observation
-            dfs(idx+1,cur,sum_m2)
-            # Option 2: take a candidate
-            for (mid,m2,R_eff) in cands_ord[idx]:
-                if mid in used: continue
-                new_sum=sum_m2+m2; K_new=len(cur)+1
-                if K_new>=self.kmin:
-                    df=2*K_new
-                    if new_sum > self.joint_relax*chi2_quantile(df,self.joint_sig): continue
-                used.add(mid); cur.append((order[idx], mid, m2, R_eff))
-                dfs(idx+1,cur,new_sum)
-                cur.pop(); used.remove(mid)
-        dfs(0,[],0.0)
-        return best_pairs
+        self.last_cone_ts = t_z
 
-    def _update_particle(self, part, obs_by_color, t_z, dt_pose, v, yr):
-        pose_p = part["pose"]
-        x_p,y_p,yaw_p = pose_p
-        if self.frame_mode=="base": Rwb=rot2d(yaw_p)
-        ll_acc=0.0
-        matched_total=0
+        # Build obs in BODY frame (pb, Sb, color). Convert to world per particle.
+        obs: List[Tuple[np.ndarray, np.ndarray, str]] = []
 
-        for name in ("blue","yellow","orange","big"):
-            bank=part["maps"][name]
-            MU=bank["mu"]; S=bank["Sigma"]; seen=bank["seen"]; tt=bank["t"]
-            OBS=obs_by_color[name]
-            if len(OBS)==0: continue
+        odom_pose, dt_pose, v, yawrate = self._pose_at(t_z)
+        x_o, y_o, yaw_o = odom_pose
+        Rwb = rot2d(yaw_o); Rbw = Rwb.T
 
-            # seed when empty
-            if MU.shape[0] == 0:
-                pts_world=[]
-                if self.frame_mode == "base":
-                    for (z, Rm) in OBS:
-                        pw = np.array([x_p, y_p]) + Rwb @ z
-                        Rw = Rwb @ Rm @ Rwb.T
-                        pts_world.append((pw, Rw))
+        def add(cones, color: str):
+            for c in cones:
+                px = float(c.point.x); py = float(c.point.y)
+                Sraw = np.array([[c.covariance[0], c.covariance[1]],
+                                 [c.covariance[2], c.covariance[3]]], float)
+                Sraw = Sraw + np.diag([self.sigma0**2, self.sigma0**2])  # BODY floor
+                if self.detections_frame == "base":
+                    pb = np.array([px, py], float); Sb = Sraw
                 else:
-                    pts_world = OBS
-                if pts_world:
-                    mu_list=[]; S_list=[]; t_list=[]; s_list=[]
-                    for (pw, Rw) in pts_world:
-                        r = float(np.linalg.norm(pw - np.array([x_p, y_p])))
-                        R_init = self._inflate_R(Rw, v, yr, dt_pose, r)
-                        mu_list.append(pw.reshape(1,2))
-                        S_list.append(R_init.reshape(1,2,2))
-                        t_list.append(t_z); s_list.append(1)
-                    bank["mu"]   = np.vstack(mu_list)
-                    bank["Sigma"]= np.vstack(S_list)
-                    bank["t"]    = np.array(t_list, float)
-                    bank["seen"] = np.array(s_list, int)
-                    MU=bank["mu"]; S=bank["Sigma"]; seen=bank["seen"]; tt=bank["t"]
+                    pw = np.array([px, py], float)
+                    pb = Rbw @ (pw - np.array([x_o, y_o]))
+                    Sb = Rbw @ Sraw @ Rbw.T
+                obs.append((pb, Sb, color))
 
-            pairs = self._jcbb(OBS, MU, S, pose_p, dt_pose, v, yr, self.crop2)
+        add(msg.blue_cones, "blue")
+        add(msg.yellow_cones, "yellow")
+        add(msg.orange_cones, "orange")
+        add(msg.big_orange_cones, "big")
+        if not obs:
+            return
 
-            # prevent double-punching the same landmark
-            if len(pairs) > 1:
-                used_landmarks=set(); filtered=[]
-                for (pi, mi, m2_gate, R_eff) in sorted(pairs, key=lambda t: t[2]):
-                    if mi in used_landmarks: continue
-                    used_landmarks.add(mi); filtered.append((pi, mi, m2_gate, R_eff))
-                pairs=filtered
+        # PF predict on Δ
+        self._pf_predict()
 
-            used_obs=set([pi for (pi,_,_,_) in pairs])
-            matched_total += len(pairs)
+        new_w = np.zeros(self.Np, float)
 
-            # EKF updates
-            for (pi, mi, _m2_gate, R_eff) in pairs:
-                z, Rm = OBS[pi]
-                if self.frame_mode=="base":
-                    z_w = np.array([x_p,y_p]) + Rwb @ z; zhat = MU[mi]; innov = z_w - zhat
+        t_start = time.perf_counter()
+        for i, p in enumerate(self.particles):
+            dx, dy, dth = p.delta
+            yaw_c = wrap(yaw_o + dth)
+            Rc = rot2d(yaw_c)
+            pc = np.array([x_o + dx, y_o + dy], float)
+
+            # ---------- Candidates (color-strict) ----------
+            cands: List[List[Tuple[int, float]]] = []
+            cand_total = 0
+            for (pb, Sb, color) in obs:
+                pw_pred = pc + Rc @ pb
+                r = float(np.linalg.norm(pb))
+                trans_var = self.alpha * (v**2) * (dt_pose**2)
+                lat_var   = self.beta  * (yawrate**2) * (dt_pose**2) * (r**2)
+                S0_w = Rc @ Sb @ Rc.T
+                Sinf = S0_w + np.diag([trans_var, trans_var])
+                if lat_var > 0.0:
+                    Sinf = Sinf + (rot2d(yaw_c) @ np.array([[0.0, 0.0],[0.0, lat_var]]) @ rot2d(yaw_c).T)
+                Sinf = Sinf.copy(); Sinf[0,0]+=1e-9; Sinf[1,1]+=1e-9
+                try: S_inv = np.linalg.inv(Sinf)
+                except np.linalg.LinAlgError: S_inv = np.linalg.pinv(Sinf)
+
+                lst = []
+                for j, lm in enumerate(p.lms):
+                    if lm.color != color:
+                        continue
+                    innov = pw_pred - lm.mean
+                    m2 = float(innov.T @ S_inv @ innov)
+                    if m2 <= self.chi2_gate:
+                        lst.append((j, m2))
+                if lst:
+                    lst.sort(key=lambda t: t[1])
+                cand_total += len(lst)
+                cands.append(lst)
+
+            # ---------- JCBB with timeout ----------
+            order = sorted(range(len(obs)), key=lambda k: len(cands[k]) if cands[k] else 9999)
+            cands_ord = [cands[k] for k in order]
+            best_pairs: List[Tuple[int, int, float]] = []
+            best_K = 0
+            used = set()
+            timed_out = False
+
+            def dfs(idx, cur_pairs, cur_sum):
+                nonlocal best_pairs, best_K, timed_out
+                if (time.perf_counter() - t_start) > self.jcbb_budget_s:
+                    timed_out = True
+                    return
+                cur_K = len(cur_pairs)
+                if cur_K + (len(cands_ord) - idx) < best_K:
+                    return
+                if cur_K >= self.min_k_for_joint:
+                    df = 2 * cur_K
+                    thresh = self.joint_relax * chi2_quantile(df, self.joint_sig)
+                    if cur_sum > thresh:
+                        return
+                if idx == len(cands_ord):
+                    if cur_K > best_K:
+                        best_K = cur_K
+                        best_pairs = cur_pairs.copy()
+                    return
+                # skip
+                dfs(idx + 1, cur_pairs, cur_sum)
+                # take
+                for (lmj, m2) in cands_ord[idx]:
+                    if lmj in used:
+                        continue
+                    used.add(lmj)
+                    cur_pairs.append((order[idx], lmj, m2))
+                    dfs(idx + 1, cur_pairs, cur_sum + m2)
+                    cur_pairs.pop()
+                    used.remove(lmj)
+
+            dfs(0, [], 0.0)
+
+            # ---------- Fallback: greedy NN if JCBB found none ----------
+            if len(best_pairs) == 0:
+                used_lm = set()
+                for oi in order:
+                    if not cands[oi]:
+                        continue
+                    lmj, m2 = min(cands[oi], key=lambda t: t[1])
+                    if lmj in used_lm:
+                        continue
+                    if m2 <= self.chi2_gate:
+                        best_pairs.append((oi, lmj, m2))
+                        used_lm.add(lmj)
+
+            # ---------- Likelihood ----------
+            m2_sum = float(sum(m2 for (_, _, m2) in best_pairs))
+            K = len(best_pairs)
+            df = 2 * max(1, K)
+            gate = self.joint_relax * chi2_quantile(df, self.joint_sig)
+            have_valid = (K >= max(2, self.min_k_for_joint) and m2_sum <= gate)
+            like = self.like_floor if not have_valid else max(math.exp(-0.5 * m2_sum), self.like_floor)
+            # allow K=1 to still give some weight (helps early promotion)
+            if K == 1 and m2_sum <= self.chi2_gate:
+                like = max(math.exp(-0.5 * m2_sum), self.like_floor)
+            new_w[i] = p.weight * like
+
+            # ---------- Conf decay for unmatched ----------
+            decay = math.exp(-self.decay_hz * max(0.0, float(dt_pose)))
+            matched_lm_ids = {lmj for (_, lmj, _) in best_pairs}
+            for lj, lm in enumerate(p.lms):
+                if lj not in matched_lm_ids:
+                    lm.conf *= decay
+
+            # ---------- EKF updates + promotion/retention ----------
+            for (oi, lmj, _) in best_pairs:
+                pb, Sb, color = obs[oi]
+                pw_pred = pc + Rc @ pb
+                lm = p.lms[lmj]
+
+                P = lm.cov
+                S0_w = Rc @ Sb @ Rc.T
+                S = P + S0_w
+                try: Sinv = np.linalg.inv(S)
+                except np.linalg.LinAlgError: Sinv = np.linalg.pinv(S)
+                Kmat = P @ Sinv
+                innov = pw_pred - lm.mean
+                lm.mean = lm.mean + Kmat @ innov
+                lm.cov  = (np.eye(2) - Kmat) @ P
+
+                lm.conf = (1.0 - self.conf_beta) * lm.conf + self.conf_beta * 1.0
+                if (lm.last_hit_t < 0.0) or ((t_z - lm.last_hit_t) >= self.prom_dt_min):
+                    lm.distinct_hits += 1
+                    lm.last_hit_t = t_z
+                lm.last_seen_t = t_z
+
+                if (not lm.promoted) and (lm.distinct_hits >= self.prom_k):
+                    lm.promoted = True
+
+                if (not lm.retained and lm.promoted and
+                    lm.conf >= self.retain_thr and
+                    lm.distinct_hits >= self.retain_hits and
+                    float(np.trace(lm.cov)) <= self.retain_cov_tr):
+                    lm.retained = True
+
+            # ---------- births / merges for unmatched obs ----------
+            matched_obs_idx = set([oi for (oi, _, _) in best_pairs])
+            for oi, (pb, Sb, color) in enumerate(obs):
+                if oi in matched_obs_idx:
+                    continue
+                pw_pred = pc + Rc @ pb
+                S0_w = Rc @ Sb @ Rc.T
+
+                # try merge
+                best_j, best_m2 = -1, float("inf")
+                for j, lm2 in enumerate(p.lms):
+                    if lm2.color != color:
+                        continue
+                    Ssum = lm2.cov + S0_w
+                    try: Sinv = np.linalg.inv(Ssum)
+                    except np.linalg.LinAlgError: Sinv = np.linalg.pinv(Ssum)
+                    m2 = float((pw_pred - lm2.mean).T @ Sinv @ (pw_pred - lm2.mean))
+                    if m2 < best_m2:
+                        best_m2, best_j = m2, j
+
+                if best_m2 <= self.merge_m2_thr and best_j >= 0:
+                    lm2 = p.lms[best_j]
+                    Kb = lm2.cov @ np.linalg.pinv(lm2.cov + S0_w)
+                    lm2.mean = lm2.mean + Kb @ (pw_pred - lm2.mean)
+                    lm2.cov  = (np.eye(2) - Kb) @ lm2.cov
+                    lm2.last_seen_t = t_z
+                    if (lm2.last_hit_t < 0.0) or ((t_z - lm2.last_hit_t) >= self.prom_dt_min):
+                        lm2.distinct_hits += 1
+                        lm2.last_hit_t = t_z
+                    lm2.conf = (1.0 - self.conf_beta) * lm2.conf + self.conf_beta * 1.0
+                    if (not lm2.promoted) and (lm2.distinct_hits >= self.prom_k):
+                        lm2.promoted = True
+                    if (not lm2.retained and lm2.promoted and
+                        lm2.conf >= self.retain_thr and
+                        lm2.distinct_hits >= self.retain_hits and
+                        float(np.trace(lm2.cov)) <= self.retain_cov_tr):
+                        lm2.retained = True
                 else:
-                    zhat = MU[mi]; innov = z - zhat
-                St = S[mi] + R_eff
-                if not np.isfinite(St).all() or not np.isfinite(innov).all(): continue
-                Sinv, logdet = safe_inv_and_logdet(St)
-                K = S[mi] @ Sinv
-                MU[mi] = (MU[mi] + K @ innov).reshape(2)
-                H = np.eye(2)
-                S[mi] = spd_joseph_update(S[mi], H, R_eff, K)
-                seen[mi] += 1; tt[mi] = t_z
-                m2_ll = float(innov.T @ Sinv @ innov)
-                ll_acc += -0.5 * (m2_ll + logdet + 2*math.log(2.0*math.pi))
+                    p.lms.append(Landmark(mean=pw_pred.copy(),
+                                          cov=S0_w.copy(),
+                                          color=color,
+                                          promoted=False,
+                                          last_seen_t=t_z,
+                                          last_hit_t=t_z,
+                                          distinct_hits=1,
+                                          conf=self.conf_beta,
+                                          retained=False))
 
-            # births / tentatives
-            new_idx=[i for i in range(len(OBS)) if i not in used_obs]
-            if new_idx:
-                T=part["tentative"][name]
-                for i in new_idx:
-                    z, Rm = OBS[i]
-                    if self.frame_mode=="base":
-                        p_world = np.array([x_p,y_p]) + Rwb @ z; Rw = Rwb @ Rm @ Rwb.T
-                    else:
-                        p_world = z; Rw = Rm
-                    merged=False
-                    for k,(p,t0,tlast,cnt,SR) in enumerate(T):
-                        try:
-                            m2 = mahal2(p, SR, p_world, Rw)
-                        except Exception:
-                            m2 = float('inf')
-                        if m2 < self.merge_m2_gate:
-                            T[k]=(0.5*p+0.5*p_world, t0, t_z, cnt+1, 0.5*(SR + Rw))
-                            merged=True; break
-                    if not merged:
-                        T.append((p_world, t_z, t_z, 1, Rw))
-                keep=[]
-                stale_horizon = 5.0*(self._rx_dt_ema if self._rx_dt_ema else 0.6)
-                for (p,t0,tlast,cnt,SR) in T:
-                    if (t_z-t0)<=self.promote_window and cnt>=self.promote_count:
-                        MU,S,seen,tt=self._promote(MU,S,seen,tt,p,SR, v, yr, dt_pose, pose_p, t_z)
-                    else:
-                        if (t_z-tlast)<stale_horizon: keep.append((p,t0,tlast,cnt,SR))
-                part["tentative"][name]=keep
+            # ---------- deletion ----------
+            keep = []
+            for lm in p.lms:
+                if lm.retained:
+                    keep.append(lm)
+                    continue
+                if (t_z - lm.last_seen_t) > self.max_unseen_s:
+                    continue
+                if lm.conf < self.prune_thr:
+                    continue
+                if float(np.trace(lm.cov)) > self.del_covtr:
+                    continue
+                keep.append(lm)
+            p.lms = keep
 
-            # write back
-            bank["mu"]=MU; bank["Sigma"]=S; bank["seen"]=seen; bank["t"]=tt
+        # normalize + resample + Δ̂
+        sw = float(np.sum(new_w))
+        if sw <= 0.0 or not math.isfinite(sw):
+            for p in self.particles:
+                p.weight = 1.0 / self.Np
+        else:
+            for i, p in enumerate(self.particles):
+                p.weight = new_w[i] / sw
 
-            # dedup with BOTH Mahalanobis & Euclidean fences
-            self._dedup_bank(bank)
+        neff = 1.0 / float(np.sum([p.weight * p.weight for p in self.particles]))
+        if neff < self.neff_ratio * self.Np:
+            self._systematic_resample()
 
-            # aging
-            if bank["mu"].shape[0]>0 and (not self.persist):
-                alive = (t_z - bank["t"]) <= self.max_age
-                bank["mu"]    = bank["mu"][alive]
-                bank["Sigma"] = bank["Sigma"][alive]
-                bank["seen"]  = bank["seen"][alive]
-                bank["t"]     = bank["t"][alive]
-            elif bank["mu"].shape[0]>0:
-                keep = (bank["seen"] >= self.persist_seen_th)
-                maybe = (t_z - bank["t"]) <= self.max_age
-                alive = np.logical_or(keep, maybe)
-                bank["mu"]    = bank["mu"][alive]
-                bank["Sigma"] = bank["Sigma"][alive]
-                bank["seen"]  = bank["seen"][alive]
-                bank["t"]     = bank["t"][alive]
+        self.delta_hat = self._estimate_delta()
 
-        if matched_total==0:
-            return math.log(self.like_floor)
-        return ll_acc
+        proc_ms = int((time.perf_counter() - t_start) * 1000)
+        if self.log_jcbb:
+            self.get_logger().info(
+                f"[fastslam/jcbb] t={t_z:7.2f}s obs={len(obs)} proc={proc_ms}ms neff={neff:.1f} "
+                f"Δ̂=[{self.delta_hat[0]:+.3f},{self.delta_hat[1]:+.3f},{math.degrees(self.delta_hat[2]):+.1f}°]"
+            )
 
-    def _promote(self, MU, S, seen, tt, p_world, Rw_meas, v, yr, dt, pose_p, t_now):
-        x_p,y_p,_ = pose_p
-        r = float(np.linalg.norm(p_world - np.array([x_p,y_p])))
-        R_init = self._inflate_R(Rw_meas, v, yr, dt, r)
+    # -------------------- PF core over Δ --------------------
+    def _pf_predict(self):
+        if self.p_std_xy > 0.0:
+            noise_xy = np.random.normal(0.0, self.p_std_xy, size=(self.Np, 2))
+        else:
+            noise_xy = np.zeros((self.Np, 2))
+        if self.p_std_yaw > 0.0:
+            noise_y = np.random.normal(0.0, self.p_std_yaw, size=(self.Np,))
+        else:
+            noise_y = np.zeros((self.Np,))
+        for i, p in enumerate(self.particles):
+            p.delta[0] += noise_xy[i, 0]
+            p.delta[1] += noise_xy[i, 1]
+            p.delta[2] = wrap(p.delta[2] + noise_y[i])
 
-        if MU.shape[0] > 0:
-            m2_best, idx_best = 1e18, -1
-            for i in range(MU.shape[0]):
-                m2i = mahal2(MU[i], S[i], p_world, R_init)
-                if m2i < m2_best: m2_best, idx_best = m2i, i
-            if m2_best < self.merge_m2_gate:
-                St = S[idx_best] + R_init
-                if not np.isfinite(St).all(): return MU,S,seen,tt
-                Sinv, _ = safe_inv_and_logdet(St)
-                K = S[idx_best] @ Sinv
-                innov = (p_world - MU[idx_best]).reshape(2)
-                MU[idx_best] = (MU[idx_best] + K @ innov).reshape(2)
-                H = np.eye(2)
-                S[idx_best] = spd_joseph_update(S[idx_best], H, R_init, K)
-                seen[idx_best] += 1
-                tt[idx_best] = t_now
-                return MU,S,seen,tt
-            # block births too close to existing
-            for i in range(MU.shape[0]):
-                if mahal2(MU[i], S[i], p_world, R_init) < (0.75 * self.merge_m2_gate):
-                    return MU,S,seen,tt
+    def _systematic_resample(self):
+        N = self.Np
+        w = np.array([p.weight for p in self.particles], float)
+        positions = (np.arange(N) + np.random.uniform()) / N
+        indexes = np.zeros(N, dtype=int)
+        cs = np.cumsum(w)
+        i, j = 0, 0
+        while i < N:
+            if positions[i] < cs[j]:
+                indexes[i] = j; i += 1
+            else:
+                j += 1
+        new_particles: List[Particle] = []
+        for idx in indexes:
+            src = self.particles[idx]
+            new_lms = [Landmark(mean=lm.mean.copy(),
+                                cov=lm.cov.copy(),
+                                color=lm.color,
+                                promoted=lm.promoted,
+                                last_seen_t=lm.last_seen_t,
+                                last_hit_t=lm.last_hit_t,
+                                distinct_hits=lm.distinct_hits,
+                                conf=lm.conf,
+                                retained=lm.retained) for lm in src.lms]
+            new_particles.append(Particle(delta=src.delta.copy(), weight=1.0/N, lms=new_lms))
+        self.particles = new_particles
 
-        if MU.shape[0]==0:
-            MU = p_world.reshape(1,2)
-            S  = R_init.reshape(1,2,2)
-            seen = np.array([1],int)
-            tt = np.array([t_now],float)
-            return MU,S,seen,tt
+    def _estimate_delta(self) -> np.ndarray:
+        w = np.array([p.weight for p in self.particles], float)
+        dx = float(np.sum(w * np.array([p.delta[0] for p in self.particles])))
+        dy = float(np.sum(w * np.array([p.delta[1] for p in self.particles])))
+        ang = np.array([p.delta[2] for p in self.particles], float)
+        cs = float(np.sum(w * np.cos(ang)))
+        sn = float(np.sum(w * np.sin(ang)))
+        dth = math.atan2(sn, cs)
+        return np.array([dx, dy, dth], float)
 
-        MU = np.vstack([MU, p_world.reshape(1,2)])
-        S  = np.vstack([S, R_init.reshape(1,2,2)])
-        seen = np.concatenate([seen, np.array([1],int)])
-        tt = np.concatenate([tt, np.array([t_now],float)])
-        return MU,S,seen,tt
+    # -------------------- Publish map from best particle --------------------
+    def _publish_map(self, t_now: float):
+        if not self.particles:
+            return
+        idx_best = int(np.argmax([p.weight for p in self.particles]))
+        p = self.particles[idx_best]
 
-    def _dedup_bank(self, bank):
-        MU = bank["mu"]; S = bank["Sigma"]; seen = bank["seen"]; tt = bank["t"]
-        n = MU.shape[0]
-        if n <= 1: return
-        r2 = self.merge_radius**2
-        idxs = list(range(n))
-        merged_mu=[]; merged_S=[]; merged_seen=[]; merged_tt=[]
-        visited = set()
-        for i in idxs:
-            if i in visited: continue
-            cluster=[i]; visited.add(i)
-            for j in idxs:
-                if j in visited: continue
-                # BOTH Mahalanobis and Euclidean must be small to merge
-                if mahal2(MU[i], S[i], MU[j], S[j]) < self.merge_m2_gate and np.sum((MU[i]-MU[j])**2) < r2:
-                    cluster.append(j); visited.add(j)
-            Info = np.zeros((2,2)); Iu = np.zeros(2); ssum=0; tmax=0.0
-            for k in cluster:
-                try: Sk_inv = np.linalg.inv(S[k])
-                except np.linalg.LinAlgError: Sk_inv = np.linalg.pinv(S[k])
-                Info += Sk_inv; Iu += Sk_inv @ MU[k]
-                ssum += seen[k]; tmax = max(tmax, tt[k])
-            try: Pm = np.linalg.inv(Info)
-            except np.linalg.LinAlgError: Pm = np.linalg.pinv(Info)
-            mum = Pm @ Iu
-            merged_mu.append(mum.reshape(1,2))
-            merged_S.append(Pm.reshape(1,2,2))
-            merged_seen.append(int(ssum))
-            merged_tt.append(float(tmax))
-        bank["mu"]   = np.vstack(merged_mu) if merged_mu else np.zeros((0,2))
-        bank["Sigma"]= np.vstack(merged_S)  if merged_S  else np.zeros((0,2,2))
-        bank["seen"] = np.array(merged_seen, dtype=int) if merged_seen else np.zeros((0,), dtype=int)
-        bank["t"]    = np.array(merged_tt, dtype=float) if merged_tt else np.zeros((0,), dtype=float)
+        out = ConeArrayWithCovariance()
+        out.header.stamp = rclpy.time.Time(seconds=t_now).to_msg()
+        out.header.frame_id = "map"
 
-    # -------- persistent global map accumulation --------
-    def _accumulate_global_map(self, best, t_now):
-        for name in ("blue","yellow","orange","big"):
-            gm = self.global_map[name]
-            MU = best["maps"][name]["mu"]; S = best["maps"][name]["Sigma"]
-            if MU.shape[0]==0: continue
-            if gm["mu"].shape[0]==0:
-                gm["mu"]=MU.copy(); gm["S"]=S.copy()
-                gm["seen"]=np.maximum(1, best["maps"][name]["seen"].copy())
-                gm["t"]=np.full((MU.shape[0],), t_now, float)
+        for lm in p.lms:
+            # publish retained OR promoted, OR early if minimally supported
+            if not (lm.retained or lm.promoted or lm.conf >= self.map_pub_conf or lm.distinct_hits >= self.map_pub_hits):
                 continue
-            mu_g, S_g, seen_g, t_g = gm["mu"], gm["S"], gm["seen"], gm["t"]
-            for i in range(MU.shape[0]):
-                mu_i = MU[i]; Si = S[i]
-                d_best, j_best = 1e18, -1
-                for j in range(mu_g.shape[0]):
-                    d = mahal2(mu_g[j], S_g[j], mu_i, Si)
-                    if d < d_best: d_best, j_best = d, j
-                if d_best < self.merge_m2_gate:
-                    try: Sg_inv = np.linalg.inv(S_g[j_best])
-                    except np.linalg.LinAlgError: Sg_inv = np.linalg.pinv(S_g[j_best])
-                    try: Si_inv = np.linalg.inv(Si)
-                    except np.linalg.LinAlgError: Si_inv = np.linalg.pinv(Si)
-                    Info = Sg_inv + Si_inv
-                    try: Pm = np.linalg.inv(Info)
-                    except np.linalg.LinAlgError: Pm = np.linalg.pinv(Info)
-                    mu = Pm @ (Sg_inv @ mu_g[j_best] + Si_inv @ mu_i)
-                    mu_g[j_best] = mu.reshape(2); S_g[j_best] = Pm
-                    seen_g[j_best] = min(32767, seen_g[j_best] + 1)
-                    t_g[j_best] = t_now
-                else:
-                    mu_g = np.vstack([mu_g, mu_i.reshape(1,2)])
-                    S_g  = np.vstack([S_g,  Si.reshape(1,2,2)])
-                    seen_g = np.concatenate([seen_g, np.array([1],int)])
-                    t_g = np.concatenate([t_g, np.array([t_now],float)])
-            gm["mu"], gm["S"], gm["seen"], gm["t"] = mu_g, S_g, seen_g, t_g
+            c = ConeWithCovariance()
+            c.point.x = float(lm.mean[0]); c.point.y = float(lm.mean[1]); c.point.z = 0.0
+            c.covariance = [float(lm.cov[0,0]), float(lm.cov[0,1]),
+                            float(lm.cov[1,0]), float(lm.cov[1,1])]
+            if lm.color == "blue":
+                out.blue_cones.append(c)
+            elif lm.color == "yellow":
+                out.yellow_cones.append(c)
+            elif lm.color == "orange":
+                out.orange_cones.append(c)
+            elif lm.color == "big":
+                out.big_orange_cones.append(c)
 
-    def _publish_map_persistent(self, ros_stamp_msg):
-        msg = ConeArrayWithCovariance()
-        msg.header.stamp = ros_stamp_msg if ros_stamp_msg is not None else rclpy.time.Time().to_msg()
-        msg.header.frame_id = "map"
-        def bank(mu, Sigma):
-            out = []
-            for i in range(mu.shape[0]):
-                cov = 0.5*(Sigma[i] + Sigma[i].T)
-                c = ConeWithCovariance()
-                c.point = Point(x=float(mu[i,0]), y=float(mu[i,1]), z=0.0)
-                c.covariance = [float(cov[0,0]), float(cov[0,1]),
-                                float(cov[1,0]), float(cov[1,1])]
-                out.append(c)
-            return out
-        gm = self.global_map
-        msg.blue_cones       = bank(gm["blue"]["mu"],   gm["blue"]["S"])
-        msg.yellow_cones     = bank(gm["yellow"]["mu"], gm["yellow"]["S"])
-        msg.orange_cones     = bank(gm["orange"]["mu"], gm["orange"]["S"])
-        msg.big_orange_cones = bank(gm["big"]["mu"],    gm["big"]["S"])
-        self.pub_map.publish(msg)
+        self.pub_map.publish(out)
 
-    # -------------------- PF boilerplate --------------------
-    def _resample_systematic_deep(self):
-        N=self.Np
-        positions=(np.arange(N)+np.random.uniform())/N
-        indexes=np.zeros(N,int)
-        cs=np.cumsum(self.weights); i=j=0
-        while i<N:
-            if positions[i]<cs[j]: indexes[i]=j; i+=1
-            else: j+=1
-        new_particles=[]
-        for k in indexes:
-            src=self.particles[k]
-            dst={"pose":src["pose"].copy(),"maps":{},"tentative":{}}
-            for name in ("blue","yellow","orange","big"):
-                m=src["maps"][name]
-                dst["maps"][name]={
-                    "mu":m["mu"].copy(),
-                    "Sigma":m["Sigma"].copy(),
-                    "seen":m["seen"].copy(),
-                    "t":m["t"].copy()
-                }
-                Tsrc=src["tentative"][name]; Tdst=[]
-                for (p,t0,tlast,cnt,SR) in Tsrc:
-                    Tdst.append((p.copy(), float(t0), float(tlast), int(cnt), SR.copy()))
-                dst["tentative"][name]=Tdst
-            new_particles.append(dst)
-        self.particles=new_particles
-        self.weights[:]=1.0/N
 
-# -------------------- main --------------------
+# --------------------- main ---------------------
 def main():
     rclpy.init()
-    node=FastSLAMCore()
+    node = FastSLAMCore()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
         if rclpy.ok():
-            node.destroy_node()
             rclpy.shutdown()
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
