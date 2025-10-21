@@ -108,7 +108,7 @@ class FastSLAMCore(Node):
         super().__init__("fastslam_core", automatically_declare_parameters_from_overrides=True)
 
         # ---- topics ----
-        self.declare_parameter("topics.pose_in", "/odometry_integration/car_state")   # override to /ground_truth/odom for GT tests
+        self.declare_parameter("topics.pose_in", "/odometry_integration/car_state")
         self.declare_parameter("topics.cones_in", "/ground_truth/cones")
         self.declare_parameter("topics.odom_out", "/fastslam/odom")
         self.declare_parameter("topics.map_out", "/fastslam/map_cones")
@@ -131,7 +131,6 @@ class FastSLAMCore(Node):
         self.declare_parameter("odom_buffer_sec", 2.0)
         self.declare_parameter("extrapolation_cap_ms", 60.0)
         self.declare_parameter("max_pairs_print", 6)
-        self.declare_parameter("drop_stale_ms", 200.0)       # NEW: skip old cone frames to avoid snaps
 
         # ---- PF ----
         self.declare_parameter("pf.num_particles", 400)
@@ -163,9 +162,12 @@ class FastSLAMCore(Node):
         self.declare_parameter("jcbb.max_obs_total", 9)
         self.declare_parameter("jcbb.max_obs_per_color", 3)
         self.declare_parameter("jcbb.cand_per_obs", 5)
-        self.declare_parameter("jcbb.time_budget_ms", 700.0)  # total budget (shared) per cones frame
+        self.declare_parameter("jcbb.time_budget_ms", 700.0)  # total per-frame budget (shared)
         self.declare_parameter("jcbb.crop_radius_m", 25.0)
         self.declare_parameter("log.jcbb", True)
+
+        # ---- Optional: drop stale cone frames (OFF by default) ----
+        self.declare_parameter("drop_stale_ms", 0.0)  # set >0 (e.g., 200) to skip old frames
 
         # ---- Map publish thresholds ----
         self.declare_parameter("map.publish_min_conf", 0.15)
@@ -185,9 +187,6 @@ class FastSLAMCore(Node):
         self.declare_parameter("nudge.gain_yaw", 0.12)
         self.declare_parameter("nudge.max_xy_step", 0.20)
         self.declare_parameter("nudge.max_yaw_step", 5.0)     # deg clamp per update
-
-        # ---- Output smoothing (visual only) ----
-        self.declare_parameter("odom.smooth_alpha", 0.0)      # 0 = off; try 0.15–0.25 to smooth tiny twitches
 
         # ---- read params ----
         gp = self.get_parameter
@@ -218,7 +217,6 @@ class FastSLAMCore(Node):
         self.odom_buffer_sec = float(gp("odom_buffer_sec").value)
         self.extrap_cap = float(gp("extrapolation_cap_ms").value) / 1000.0
         self.max_pairs_print = int(gp("max_pairs_print").value)
-        self.drop_stale_s = float(gp("drop_stale_ms").value) / 1000.0
 
         self.Np = int(gp("pf.num_particles").value)
         self.neff_ratio = float(gp("pf.resample_neff_ratio").value)
@@ -249,6 +247,7 @@ class FastSLAMCore(Node):
         self.jcbb_budget_s   = float(gp("jcbb.time_budget_ms").value) / 1000.0
         self.crop_radius_m   = float(gp("jcbb.crop_radius_m").value)
         self.log_jcbb        = bool(gp("log.jcbb").value)
+        self.drop_stale_s    = float(gp("drop_stale_ms").value) / 1000.0
 
         self.map_pub_conf = float(gp("map.publish_min_conf").value)
         self.map_pub_hits = int(gp("map.publish_min_hits").value)
@@ -266,8 +265,6 @@ class FastSLAMCore(Node):
         self.nudge_max_xy  = float(gp("nudge.max_xy_step").value)
         self.nudge_max_yaw = math.radians(float(gp("nudge.max_yaw_step").value))  # deg->rad
 
-        self.odom_alpha    = float(gp("odom.smooth_alpha").value)
-
         # ---- state ----
         np.random.seed(self.seed)
         self.particles: List[Particle] = [
@@ -280,7 +277,6 @@ class FastSLAMCore(Node):
                 p.delta[2] = np.random.normal(0.0, self.init_std_yaw)
 
         self.delta_hat = np.zeros(3, float)
-        self.delta_pub = np.zeros(3, float)   # smoothed-for-publish copy (visual only)
         self.have_pose_feed = False
 
         # odom buffer: (t, x, y, yaw, v, yawrate)
@@ -301,24 +297,17 @@ class FastSLAMCore(Node):
 
     # -------------------- odom buffer helpers --------------------
     def _pose_at(self, t_query: float):
-        """Return pose at t_query (x,y,yaw), plus a timing mismatch dt_pose (used for inflation),
-           and the v, yawrate at the *anchor* used. Δt semantics:
-           - If interpolating between two stamps -> dt_pose = 0.0
-           - If extrapolating beyond the newest -> clamp to self.extrap_cap and return that clamped dt
-           - If before the first -> dt_pose = 0.0 (we don't inflate for unknown history)
-        """
+        """Return pose at t_query (x,y,yaw), plus timing mismatch dt_pose used for inflation."""
         if not self.odom_buf:
             return self.pose_latest.copy(), float('inf'), 0.0, 0.0
 
         times = [it[0] for it in self.odom_buf]
         idx = bisect.bisect_left(times, t_query)
 
-        # Before first: no inflation
         if idx == 0:
             t0, x0, y0, yaw0, v0, yr0 = self.odom_buf[0]
             return np.array([x0, y0, yaw0], float), 0.0, v0, yr0
 
-        # After last: clamp extrapolation
         if idx >= len(self.odom_buf):
             t1, x1, y1, yaw1, v1, yr1 = self.odom_buf[-1]
             dt = t_query - t1
@@ -333,7 +322,6 @@ class FastSLAMCore(Node):
                 yaw = wrap(yaw1 + yr1 * dt_c)
             return np.array([x, y, yaw], float), abs(dt_c), v1, yr1
 
-        # Interpolation at exact query -> zero mismatch
         t0, x0, y0, yaw0, v0, yr0 = self.odom_buf[idx - 1]
         t1, x1, y1, yaw1, v1, yr1 = self.odom_buf[idx]
         if t1 == t0:
@@ -349,11 +337,7 @@ class FastSLAMCore(Node):
     # -------------------- cap observations to bound JCBB time --------------------
     def _cap_observations(self, obs: List[Tuple[np.ndarray, np.ndarray, str]]) \
             -> List[Tuple[np.ndarray, np.ndarray, str]]:
-        """
-        obs: list of (pb, Sb, color) in BODY frame.
-        Keep nearest-by-range per color up to jcbb.max_obs_per_color, then
-        globally cap to jcbb.max_obs_total by nearest range.
-        """
+        """Per-color cap, then global cap by nearest range in BODY frame."""
         if not obs:
             return obs
 
@@ -368,11 +352,10 @@ class FastSLAMCore(Node):
 
         capped = []
         per_col = max(1, self.max_obs_per_col)
-        for col, arr in by_color.items():
-            if not arr:
-                continue
-            arr.sort(key=_r)
-            capped.extend(arr[:per_col])
+        for arr in by_color.values():
+            if arr:
+                arr.sort(key=_r)
+                capped.extend(arr[:per_col])
 
         total_cap = max(1, self.max_obs_total)
         if len(capped) <= total_cap:
@@ -402,7 +385,7 @@ class FastSLAMCore(Node):
             self.have_pose_feed = True
             self.get_logger().info("[fastslam] proposal feed ready.")
 
-        dx, dy, dth = self.delta_pub  # publish smoothed (visual) delta if enabled
+        dx, dy, dth = self.delta_hat
         yaw_c = wrap(yaw + dth)
         x_c = x + dx
         y_c = y + dy
@@ -431,19 +414,21 @@ class FastSLAMCore(Node):
             return
 
         t_frame_start = time.perf_counter()
-
         t_z = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
+
+        # simple downsampler to ~target_cone_hz
         if self.last_cone_ts is not None:
             if (t_z - self.last_cone_ts) < (1.0 / max(1e-3, self.target_cone_hz)):
                 return
         self.last_cone_ts = t_z
 
-        # Drop stale frames to avoid backlog-induced snaps
-        now_s = self.get_clock().now().nanoseconds * 1e-9
-        if (now_s - t_z) > self.drop_stale_s:
-            return
+        # optional: skip stale frames to avoid backlog (OFF by default)
+        if self.drop_stale_s > 0.0:
+            now_s = self.get_clock().now().nanoseconds * 1e-9
+            if (now_s - t_z) > self.drop_stale_s:
+                return
 
-        # Build obs in BODY frame (pb, Sb, color). Convert to world per particle.
+        # Build obs in BODY frame (pb, Sb, color)
         obs: List[Tuple[np.ndarray, np.ndarray, str]] = []
 
         odom_pose, dt_pose, v, yawrate = self._pose_at(t_z)
@@ -455,8 +440,7 @@ class FastSLAMCore(Node):
                 px = float(c.point.x); py = float(c.point.y)
                 Sraw = np.array([[c.covariance[0], c.covariance[1]],
                                  [c.covariance[2], c.covariance[3]]], float)
-                # BODY noise floor
-                Sraw = Sraw + np.diag([self.sigma0**2, self.sigma0**2])
+                Sraw = Sraw + np.diag([self.sigma0**2, self.sigma0**2])  # BODY floor
                 if self.detections_frame == "base":
                     pb = np.array([px, py], float); Sb = Sraw
                 else:
@@ -472,7 +456,7 @@ class FastSLAMCore(Node):
         if not obs:
             return
 
-        # NEW: enforce configured caps to bound JCBB time
+        # ENFORCE CAPS to keep JCBB bounded
         obs = self._cap_observations(obs)
 
         # PF predict on Δ
@@ -487,12 +471,12 @@ class FastSLAMCore(Node):
             scale = min(max(scale, self.gate_min), self.gate_max)
             chi2_gate *= scale
 
-        # --------- Per-frame JCBB budget sharing (keeps proc time bounded) ---------
-        # Distribute total budget across particles; clamp per-particle slice to [1ms, 15ms]
-        pp_budget = self.jcbb_budget_s / float(min(self.Np, 64))
-        pp_budget = max(0.001, min(pp_budget, 0.015))
-
         new_w = np.zeros(self.Np, float)
+
+        # Per-FRAME budget shared across particles (prevents long stalls).
+        # Example: 700ms / min(Np,64) => ~10–11ms per particle.
+        pp_budget = self.jcbb_budget_s / float(min(self.Np, 64))
+        pp_budget = max(0.001, min(pp_budget, 0.015))  # clamp to [1ms, 15ms]
 
         for i, p in enumerate(self.particles):
             dx, dy, dth = p.delta
@@ -500,7 +484,6 @@ class FastSLAMCore(Node):
             Rc = rot2d(yaw_c)
             pc = np.array([x_o + dx, y_o + dy], float)
 
-            # ---------- build candidates (color-strict), proper gating with S = P + R ----------
             cands: List[List[Tuple[int, float]]] = []
             total_cands = 0
             gate_eff = chi2_gate
@@ -509,20 +492,16 @@ class FastSLAMCore(Node):
 
             for (pb, Sb, color) in obs:
                 pw_pred = pc + Rc @ pb
-
-                # measurement covariance in world
                 S0_w = Rc @ Sb @ Rc.T
 
-                # kinematic inflations (correct yaw shape)
+                # kinematic inflations
                 trans_var = self.alpha * (v ** 2) * (dt_pose ** 2)
                 sigma_theta2 = self.beta * ((yawrate * dt_pose) ** 2)
-                u = Rc @ (J @ pb)  # direction perpendicular to measurement ray (world)
+                u = Rc @ (J @ pb)
                 S_yaw = sigma_theta2 * np.outer(u, u)
-                S_trans = np.eye(2) * trans_var
-                R = S0_w + S_trans + S_yaw
+                R = S0_w + np.eye(2) * trans_var + S_yaw
                 R[0,0] += 1e-9; R[1,1] += 1e-9
 
-                # coarse crop
                 near_idx = []
                 if p.lms:
                     for j, lm in enumerate(p.lms):
@@ -535,15 +514,12 @@ class FastSLAMCore(Node):
                         near_idx.append(j)
 
                 lst = []
-                # IMPORTANT: gate using S = P + R (NOT R alone)
                 for j in near_idx:
                     lm = p.lms[j]
                     innov = pw_pred - lm.mean
                     S_gate = lm.cov + R
-                    try:
-                        Sinv = np.linalg.inv(S_gate)
-                    except np.linalg.LinAlgError:
-                        Sinv = np.linalg.pinv(S_gate)
+                    try: Sinv = np.linalg.inv(S_gate)
+                    except np.linalg.LinAlgError: Sinv = np.linalg.pinv(S_gate)
                     m2 = float(innov.T @ Sinv @ innov)
                     if m2 <= gate_eff:
                         lst.append((j, m2))
@@ -555,12 +531,10 @@ class FastSLAMCore(Node):
                 total_cands += len(lst)
                 cands.append(lst)
 
-            # Fine adapt & optional pruning to make it bite without rebuilds
             avg_c = (total_cands / max(1, len(obs)))
             if self.adapt_gate:
                 if avg_c > (self.gate_target * 1.5):
                     gate_eff = max(self.gate_min * self.chi2_gate_base, gate_eff * 0.8)
-                    # prune tails
                     keep = max(1, int(math.ceil(self.gate_target)))
                     for k in range(len(cands)):
                         if cands[k]:
@@ -568,13 +542,12 @@ class FastSLAMCore(Node):
                 elif avg_c < 0.5:
                     gate_eff = min(self.gate_max * self.chi2_gate_base, gate_eff * 1.25)
 
-            # ---------- JCBB with per-particle timeout (shared per-frame) ----------
+            # ---------- JCBB with per-particle deadline ----------
             order = sorted(range(len(obs)), key=lambda k: len(cands[k]) if cands[k] else 9999)
             cands_ord = [cands[k] for k in order]
             best_pairs: List[Tuple[int, int, float]] = []
             best_K = 0
             used = set()
-
             t_deadline = time.perf_counter() + pp_budget
 
             def dfs(idx, cur_pairs, cur_sum):
@@ -594,10 +567,8 @@ class FastSLAMCore(Node):
                         best_K = cur_K
                         best_pairs = cur_pairs.copy()
                     return
-                # skip
-                dfs(idx + 1, cur_pairs, cur_sum)
-                # take
-                for (lmj, m2) in cands_ord[idx]:
+                dfs(idx + 1, cur_pairs, cur_sum)  # skip
+                for (lmj, m2) in cands_ord[idx]:  # take
                     if lmj in used:
                         continue
                     used.add(lmj)
@@ -608,7 +579,7 @@ class FastSLAMCore(Node):
 
             dfs(0, [], 0.0)
 
-            # ---------- Fallback: greedy NN if nothing ----------
+            # Fallback: greedy NN if nothing
             if len(best_pairs) == 0:
                 used_lm = set()
                 for oi in order:
@@ -621,40 +592,38 @@ class FastSLAMCore(Node):
                         best_pairs.append((oi, lmj, m2))
                         used_lm.add(lmj)
 
-            # ---------- Likelihood ----------
+            # Likelihood
             m2_sum = float(sum(m2 for (_, _, m2) in best_pairs))
             K = len(best_pairs)
             df = 2 * max(1, K)
             gate_joint = self.joint_relax * chi2_quantile(df, self.joint_sig)
             have_valid = (K >= max(2, self.min_k_for_joint) and m2_sum <= gate_joint)
             like = self.like_floor if not have_valid else max(math.exp(-0.5 * m2_sum), self.like_floor)
-            if K == 1 and m2_sum <= gate_eff:  # allow small weight from singletons
+            if K == 1 and m2_sum <= gate_eff:
                 like = max(math.exp(-0.5 * m2_sum), self.like_floor)
             new_w[i] = p.weight * like
 
-            # ---------- Conf decay for unmatched ----------
+            # Conf decay for unmatched
             decay = math.exp(-self.decay_hz * max(0.0, float(dt_pose)))
             matched_lm_ids = {lmj for (_, lmj, _) in best_pairs}
             for lj, lm in enumerate(p.lms):
                 if lj not in matched_lm_ids:
                     lm.conf *= decay
 
-            # ---------- EKF updates + promotion/retention ----------
-            innovations_world = []   # for drift nudge
-            yaw_terms = []           # (Rc@pb, innov)
+            # EKF updates + promotion/retention
+            innovations_world = []
+            yaw_terms = []
             for (oi, lmj, _) in best_pairs:
                 pb, Sb, color = obs[oi]
                 pw_pred = pc + Rc @ pb
                 lm = p.lms[lmj]
 
-                # measurement covariance (consistent with gating)
                 S0_w = Rc @ Sb @ Rc.T
                 trans_var = self.alpha * (v ** 2) * (dt_pose ** 2)
                 sigma_theta2 = self.beta * ((yawrate * dt_pose) ** 2)
                 u = Rc @ (J @ pb)
                 S_yaw = sigma_theta2 * np.outer(u, u)
-                S_trans = np.eye(2) * trans_var
-                R = S0_w + S_trans + S_yaw
+                R = S0_w + np.eye(2) * trans_var + S_yaw
                 R[0,0] += 1e-9; R[1,1] += 1e-9
 
                 P = lm.cov
@@ -666,7 +635,6 @@ class FastSLAMCore(Node):
                 lm.mean = lm.mean + Kmat @ innov
                 lm.cov  = (np.eye(2) - Kmat) @ P
 
-                # collect for nudging
                 innovations_world.append(innov)
                 yaw_terms.append((Rc @ pb, innov))
 
@@ -675,34 +643,28 @@ class FastSLAMCore(Node):
                     lm.distinct_hits += 1
                     lm.last_hit_t = t_z
                 lm.last_seen_t = t_z
-
                 if (not lm.promoted) and (lm.distinct_hits >= self.prom_k):
                     lm.promoted = True
-
                 if (not lm.retained and lm.promoted and
                     lm.conf >= self.retain_thr and
                     lm.distinct_hits >= self.retain_hits and
                     float(np.trace(lm.cov)) <= self.retain_cov_tr):
                     lm.retained = True
 
-            # ---------- births / merges for unmatched obs ----------
+            # births / merges for unmatched obs
             matched_obs_idx = set([oi for (oi, _, _) in best_pairs])
             for oi, (pb, Sb, color) in enumerate(obs):
                 if oi in matched_obs_idx:
                     continue
                 pw_pred = pc + Rc @ pb
-
-                # measurement covariance (same as above)
                 S0_w = Rc @ Sb @ Rc.T
                 trans_var = self.alpha * (v ** 2) * (dt_pose ** 2)
                 sigma_theta2 = self.beta * ((yawrate * dt_pose) ** 2)
                 u = Rc @ (J @ pb)
                 S_yaw = sigma_theta2 * np.outer(u, u)
-                S_trans = np.eye(2) * trans_var
-                R = S0_w + S_trans + S_yaw
+                R = S0_w + np.eye(2) * trans_var + S_yaw
                 R[0,0] += 1e-9; R[1,1] += 1e-9
 
-                # try merge
                 best_j, best_m2 = -1, float("inf")
                 for j, lm2 in enumerate(p.lms):
                     if lm2.color != color:
@@ -732,7 +694,6 @@ class FastSLAMCore(Node):
                         float(np.trace(lm2.cov)) <= self.retain_cov_tr):
                         lm2.retained = True
                 else:
-                    # birth: use R (full measurement noise) as initial covariance; not just S0_w
                     p.lms.append(Landmark(mean=pw_pred.copy(),
                                           cov=R.copy(),
                                           color=color,
@@ -743,37 +704,11 @@ class FastSLAMCore(Node):
                                           conf=self.conf_beta,
                                           retained=False))
 
-            # ---------- drift nudge on Δ (small, bounded) – only when association is strong ----------
-            if self.nudge_enable:
-                if have_valid and len(innovations_world) >= 2:
-                    innov_mean = np.mean(np.vstack(innovations_world), axis=0)  # world xy
-                    step_xy = -self.nudge_xy * innov_mean
-                    # yaw step via cross((Rc@pb), innov) / ||pb||^2 averaged
-                    yaw_accum = 0.0; denom = 0.0
-                    for pwb, inn in yaw_terms:
-                        r2 = float(np.dot(pwb, pwb)) + 1e-6
-                        # For small angles, innovation ~ dθ * [ -y_b, x_b ], use z-cross:
-                        yaw_accum += (pwb[0]*inn[1] - pwb[1]*inn[0]) / r2
-                        denom += 1.0
-                    step_yaw = -self.nudge_yaw * (yaw_accum / max(1.0, denom))
-
-                    # clamp
-                    nrm = float(np.linalg.norm(step_xy))
-                    if nrm > self.nudge_max_xy:
-                        step_xy *= (self.nudge_max_xy / nrm)
-                    if abs(step_yaw) > self.nudge_max_yaw:
-                        step_yaw = math.copysign(self.nudge_max_yaw, step_yaw)
-
-                    p.delta[0] += float(step_xy[0])
-                    p.delta[1] += float(step_xy[1])
-                    p.delta[2] = wrap(p.delta[2] + float(step_yaw))
-
-            # ---------- deletion ----------
+            # deletion
             keep = []
             for lm in p.lms:
                 if lm.retained:
-                    keep.append(lm)
-                    continue
+                    keep.append(lm); continue
                 if (t_z - lm.last_seen_t) > self.max_unseen_s:
                     continue
                 if lm.conf < self.prune_thr:
@@ -798,23 +733,11 @@ class FastSLAMCore(Node):
 
         self.delta_hat = self._estimate_delta()
 
-        # Visual-only smoothing for published odom
-        if 0.0 < self.odom_alpha < 1.0:
-            a = self.odom_alpha
-            self.delta_pub[0] = (1-a)*self.delta_pub[0] + a*self.delta_hat[0]
-            self.delta_pub[1] = (1-a)*self.delta_pub[1] + a*self.delta_hat[1]
-            cs = (1-a)*math.cos(self.delta_pub[2]) + a*math.cos(self.delta_hat[2])
-            sn = (1-a)*math.sin(self.delta_pub[2]) + a*math.sin(self.delta_hat[2])
-            self.delta_pub[2] = math.atan2(sn, cs)
-        else:
-            self.delta_pub = self.delta_hat.copy()
-
         proc_ms = int((time.perf_counter() - t_frame_start) * 1000)
         if self.log_jcbb:
             self.get_logger().info(
-                f"[fastslam/jcbb] t={t_z:7.2f}s obs={len(obs)} proc={proc_ms}ms "
-                f"neff={neff:.1f} Δ̂=[{self.delta_hat[0]:+.3f},{self.delta_hat[1]:+.3f},{math.degrees(self.delta_hat[2]):+.1f}°] "
-                f"pp_budget={pp_budget*1000:.1f}ms"
+                f"[fastslam/jcbb] t={t_z:7.2f}s obs={len(obs)} proc={proc_ms}ms neff={neff:.1f} "
+                f"Δ̂=[{self.delta_hat[0]:+.3f},{self.delta_hat[1]:+.3f},{math.degrees(self.delta_hat[2]):+.1f}°]"
             )
 
     # -------------------- PF core over Δ --------------------
@@ -856,7 +779,6 @@ class FastSLAMCore(Node):
                                 distinct_hits=lm.distinct_hits,
                                 conf=lm.conf,
                                 retained=lm.retained) for lm in src.lms]
-        # NOTE: deepcopy of landmarks above; copy deltas and reset weights
             new_particles.append(Particle(delta=src.delta.copy(), weight=1.0/N, lms=new_lms))
         self.particles = new_particles
 
@@ -882,7 +804,6 @@ class FastSLAMCore(Node):
         out.header.frame_id = "map"
 
         for lm in p.lms:
-            # publish retained OR promoted, OR early if minimally supported
             if not (lm.retained or lm.promoted or lm.conf >= self.map_pub_conf or lm.distinct_hits >= self.map_pub_hits):
                 continue
             c = ConeWithCovariance()
