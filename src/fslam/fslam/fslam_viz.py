@@ -25,14 +25,19 @@ class FastSLAMMapTrajViz(Node):
     def __init__(self):
         super().__init__("fastslam_map_traj_viz", automatically_declare_parameters_from_overrides=True)
 
+        # --- parameters ---
         self.declare_parameter("topics.odom", "/fastslam/odom")
         self.declare_parameter("topics.map", "/fastslam/map_cones")
+        self.declare_parameter("topics.gt_odom", "/ground_truth/odom")
+        self.declare_parameter("show_gt", True)
         self.declare_parameter("fps", 20.0)
         self.declare_parameter("traj.max_points", 20000)
         self.declare_parameter("quiet", True)
 
         self.topic_odom = str(self.get_parameter("topics.odom").value)
         self.topic_map = str(self.get_parameter("topics.map").value)
+        self.topic_gt_odom = str(self.get_parameter("topics.gt_odom").value)
+        self.show_gt = bool(self.get_parameter("show_gt").value)
         self.fps = float(self.get_parameter("fps").value)
         self.traj_cap = int(self.get_parameter("traj.max_points").value)
         self.quiet = bool(self.get_parameter("quiet").value)
@@ -44,25 +49,36 @@ class FastSLAMMapTrajViz(Node):
             durability=QoSDurabilityPolicy.VOLATILE
         )
 
+        # --- subscriptions ---
         self.create_subscription(Odometry, self.topic_odom, self.cb_odom, qos_rel)
         self.create_subscription(ConeArrayWithCovariance, self.topic_map, self.cb_map, qos_rel)
+        if self.show_gt and self.topic_gt_odom:
+            self.create_subscription(Odometry, self.topic_gt_odom, self.cb_gt_odom, qos_rel)
 
+        # --- traces ---
         self.traj_x = deque(maxlen=self.traj_cap)
         self.traj_y = deque(maxlen=self.traj_cap)
 
+        self.gt_x = deque(maxlen=self.traj_cap)
+        self.gt_y = deque(maxlen=self.traj_cap)
+
+        # --- map points ---
         self.blue = np.zeros((0, 2), float)
         self.yellow = np.zeros((0, 2), float)
         self.orange = np.zeros((0, 2), float)
         self.big = np.zeros((0, 2), float)
 
+        # --- figure ---
         self.fig, self.ax = plt.subplots(figsize=(8, 8))
-        self.ax.set_title("FastSLAM: Trajectory + Map")
+        self.ax.set_title("FastSLAM: Trajectory + Ground Truth + Map")
         self.ax.set_xlabel("X (m)")
         self.ax.set_ylabel("Y (m)")
         self.ax.set_aspect("equal", adjustable="box")
         self.ax.grid(True, ls="--", alpha=0.25)
 
-        (self.traj_line,) = self.ax.plot([], [], lw=1.8, label="Trajectory")
+        (self.traj_line,) = self.ax.plot([], [], lw=1.8, label="FastSLAM Trajectory", color="tab:cyan")
+        (self.gt_line,) = self.ax.plot([], [], lw=1.8, ls="--", label="Ground Truth", color="black", alpha=0.85)
+
         self.sc_blue = self.ax.scatter([], [], s=18, label="Blue", c="tab:blue")
         self.sc_yel = self.ax.scatter([], [], s=18, label="Yellow", c="gold")
         self.sc_org = self.ax.scatter([], [], s=18, label="Orange", c="darkorange")
@@ -82,11 +98,18 @@ class FastSLAMMapTrajViz(Node):
 
         self.fig.canvas.mpl_connect("close_event", _on_close)
 
+    # --- callbacks ---
     def cb_odom(self, msg: Odometry):
         x = float(msg.pose.pose.position.x)
         y = float(msg.pose.pose.position.y)
         self.traj_x.append(x)
         self.traj_y.append(y)
+
+    def cb_gt_odom(self, msg: Odometry):
+        x = float(msg.pose.pose.position.x)
+        y = float(msg.pose.pose.position.y)
+        self.gt_x.append(x)
+        self.gt_y.append(y)
 
     def cb_map(self, msg: ConeArrayWithCovariance):
         def arr(cones):
@@ -101,20 +124,33 @@ class FastSLAMMapTrajViz(Node):
         self.orange = arr(msg.orange_cones)
         self.big = arr(msg.big_orange_cones)
 
+    # --- animation tick ---
     def _on_anim_tick(self, _frame):
+        # lines
         if self.traj_x and self.traj_y:
             self.traj_line.set_data(list(self.traj_x), list(self.traj_y))
         else:
             self.traj_line.set_data([], [])
 
+        if self.show_gt and self.gt_x and self.gt_y:
+            self.gt_line.set_data(list(self.gt_x), list(self.gt_y))
+            self.gt_line.set_visible(True)
+        else:
+            self.gt_line.set_data([], [])
+            self.gt_line.set_visible(self.show_gt)
+
+        # scatters
         self.sc_blue.set_offsets(self.blue if self.blue.size else np.zeros((0, 2)))
         self.sc_yel.set_offsets(self.yellow if self.yellow.size else np.zeros((0, 2)))
         self.sc_org.set_offsets(self.orange if self.orange.size else np.zeros((0, 2)))
         self.sc_big.set_offsets(self.big if self.big.size else np.zeros((0, 2)))
 
+        # autoscale
         stacks = []
         if self.traj_x and self.traj_y:
             stacks.append(np.column_stack([np.array(self.traj_x), np.array(self.traj_y)]))
+        if self.show_gt and self.gt_x and self.gt_y:
+            stacks.append(np.column_stack([np.array(self.gt_x), np.array(self.gt_y)]))
         for a in (self.blue, self.yellow, self.orange, self.big):
             if a.size:
                 stacks.append(a)
@@ -135,7 +171,7 @@ class FastSLAMMapTrajViz(Node):
         self.fig.tight_layout()
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
-        return (self.traj_line, self.sc_blue, self.sc_yel, self.sc_org, self.sc_big)
+        return (self.traj_line, self.gt_line, self.sc_blue, self.sc_yel, self.sc_org, self.sc_big)
 
 
 def main():
