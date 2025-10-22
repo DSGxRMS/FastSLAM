@@ -13,8 +13,8 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Quaternion as QuaternionMsg
 from geometry_msgs.msg import Pose2D
 
-G = 9.80665   # m/s^2
-DT_MAX = 0.01 # s, sub-step cap for deterministic integration of gaps
+G = 9.80665
+DT_MAX = 0.01  # s, sub-step cap
 
 def wrap(a): return (a + math.pi) % (2*math.pi) - math.pi
 
@@ -41,45 +41,39 @@ def quat_from_yaw(yaw) -> QuaternionMsg:
     q.w = math.cos(yaw/2.0)
     return q
 
-def is_finite(*vals):
-    return all(map(math.isfinite, vals))
+def is_finite(*vals): return all(map(math.isfinite, vals))
 
-class ImuWheelEKF(Node):
+
+class ImuWheelEKF(Node):  # keep class name for your entry-point
     def __init__(self):
         super().__init__("fastslam_localizer", automatically_declare_parameters_from_overrides=True)
 
-        # ---- Params ----
+        # --- Params ---
         self.declare_parameter("topics.imu", "/imu/data")
         self.declare_parameter("topics.gt_odom", "/ground_truth/odom")
         self.declare_parameter("topics.out_odom", "/odometry_integration/car_state")
         self.declare_parameter("topics.out_pose2d", "/odometry_integration/pose2d")
 
         self.declare_parameter("run.bias_window_s", 5.0)
-        self.declare_parameter("run.bias_min_samples", 200)   # new: require enough stationary samples
+        self.declare_parameter("run.bias_min_samples", 200)
         self.declare_parameter("log.cli_hz", 1.0)
 
-        self.declare_parameter("input.imu_use_rate_hz", 0.0)  # 0 => use all IMU
+        self.declare_parameter("input.imu_use_rate_hz", 0.0)   # 0 => use all IMU samples
+        self.declare_parameter("vel_leak_hz", 0.0)             # keep 0.0 while debugging
+        self.declare_parameter("gravity.sign", -1.0)           # world g = [0,0,sign*G] (ENU Z-up => -1)
 
-        # Keep defaults at 0.0 so prediction matches your predictor exactly.
-        self.declare_parameter("proc.sigma_acc", 0.0)
-        self.declare_parameter("proc.sigma_yaw", 0.0)
-        self.declare_parameter("init.sigma_v", 0.0)
-        self.declare_parameter("vel_leak_hz", 0.0)
-
-        # Yaw scale calibration params (robust)
+        # Yaw-scale (centripetal), deterministic updates
         self.declare_parameter("yawscale.enable", True)
-        self.declare_parameter("yawscale.alpha", 0.04)          # EMA base factor
-        self.declare_parameter("yawscale.v_min", 0.5)           # m/s, need motion
-        self.declare_parameter("yawscale.gz_min", 0.1)          # rad/s, need turn
+        self.declare_parameter("yawscale.alpha", 0.04)         # EMA toward median
+        self.declare_parameter("yawscale.v_min", 0.5)          # m/s
+        self.declare_parameter("yawscale.gz_min", 0.10)        # rad/s
+        self.declare_parameter("yawscale.aperp_min", 0.40)     # m/s^2
+        self.declare_parameter("yawscale.par_over_perp_max", 0.5)
         self.declare_parameter("yawscale.k_min", 0.6)
         self.declare_parameter("yawscale.k_max", 2.4)
-        self.declare_parameter("yawscale.aperp_min", 0.4)       # m/s^2, reject noise
-        self.declare_parameter("yawscale.par_over_perp_max", 0.5)  # |a_par| <= r * |a_perp|
-
-        # new: robustization of k_yaw update
-        self.declare_parameter("yawscale.update_period_s", 0.25)  # update k_yaw at ~4 Hz using median
+        self.declare_parameter("yawscale.update_period_s", 0.25)  # ~4 Hz
         self.declare_parameter("yawscale.window_s", 0.75)         # median window
-        self.declare_parameter("yawscale.step_max", 0.05)         # |Δk| per update clamp
+        self.declare_parameter("yawscale.step_max", 0.05)         # |Δk| clamp
 
         P = lambda k: self.get_parameter(k).value
         self.topic_imu   = str(P("topics.imu"))
@@ -91,90 +85,126 @@ class ImuWheelEKF(Node):
         self.bias_min_samples  = int(P("run.bias_min_samples"))
         self.cli_hz            = float(P("log.cli_hz"))
         self.imu_use_rate_hz   = float(P("input.imu_use_rate_hz"))
+        self.vel_leak_hz       = float(P("vel_leak_hz"))
+        self.gravity_sign      = float(P("gravity.sign"))
 
-        self.sigma_acc   = float(P("proc.sigma_acc"))
-        self.sigma_yaw   = float(P("proc.sigma_yaw"))
-        self.init_sigma_v= float(P("init.sigma_v"))
-        self.vel_leak_hz = float(P("vel_leak_hz"))
-
-        # Yaw scale cfg
-        self.yawscale_enable = bool(P("yawscale.enable"))
-        self.yawscale_alpha  = float(P("yawscale.alpha"))
-        self.yawscale_v_min  = float(P("yawscale.v_min"))
-        self.yawscale_gz_min = float(P("yawscale.gz_min"))
-        self.yawscale_k_min  = float(P("yawscale.k_min"))
-        self.yawscale_k_max  = float(P("yawscale.k_max"))
-        self.yawscale_aperp_min = float(P("yawscale.aperp_min"))
+        self.yawscale_enable   = bool(P("yawscale.enable"))
+        self.yawscale_alpha    = float(P("yawscale.alpha"))
+        self.yawscale_v_min    = float(P("yawscale.v_min"))
+        self.yawscale_gz_min   = float(P("yawscale.gz_min"))
+        self.yawscale_aperp_min= float(P("yawscale.aperp_min"))
         self.yawscale_par_over_perp_max = float(P("yawscale.par_over_perp_max"))
-        self.k_update_period = float(P("yawscale.update_period_s"))
-        self.k_window_s      = float(P("yawscale.window_s"))
-        self.k_step_max      = float(P("yawscale.step_max"))
+        self.yawscale_k_min    = float(P("yawscale.k_min"))
+        self.yawscale_k_max    = float(P("yawscale.k_max"))
+        self.k_update_period   = float(P("yawscale.update_period_s"))
+        self.k_window_s        = float(P("yawscale.window_s"))
+        self.k_step_max        = float(P("yawscale.step_max"))
 
-        # ---- EKF State ----
-        # x = [x, y, yaw, vx, vy]
+        # --- State x=[x, y, yaw, vx, vy] ---
         self.x = np.zeros(5, float)
-        self.P = np.diag([1e-4, 1e-4, 1e-4,
-                          max(1e-4, self.init_sigma_v**2),
-                          max(1e-4, self.init_sigma_v**2)])
 
         # Bias & timing
         self.bias_locked = False
         self.bias_t0 = None
-        self.acc_b = np.zeros(3)
+        self.acc_b = np.zeros(3)     # true accel bias (body)
         self.gz_b  = 0.0
-        self._acc_buf=[]; self._gz_buf=[]
         self._bias_samp_count = 0
+        self._acc_bias_sum = np.zeros(3)  # accumulates (raw - Rbw*g_world)
+        self._gz_sum = 0.0
 
         self.last_imu_t = None
         self._last_imu_proc_t = None
 
-        # Previous signals for trapezoidal integration
+        # Trapezoid prev inputs (first post-lock will init from real sample)
         self._prev_axw = None
         self._prev_ayw = None
         self._prev_gz  = None
 
-        # Yaw scale state
-        self.k_yaw = 1.0                    # multiplicative scale applied to gyro z
-        self._k_obs_buf = deque()           # (t, k_obs)
+        # Yaw-scale state (deterministic)
+        self.k_yaw = 1.0
+        self._k_obs_buf = deque()
         self._last_k_update_t = None
 
-        # GT logs
+        # Optional GT logs
         self.gt_t=[]; self.gt_x=[]; self.gt_y=[]; self.gt_v=[]; self.gt_yaw=[]
 
-        # Logs
-        self.pred_log = []   # (t, x, y, yaw, v_pred)
-        self.corr_log = []   # (t, x, y, yaw, v_corr)
-
+        # Logs / helpers
+        self.pred_log = []
+        self.corr_log = []
+        self.last_output = None
         self.last_cli = time.time()
         self.last_yawrate = 0.0
         self.last_axw = 0.0
-        self.last_output = None
-
-        # Deterministic seed if velocity init randomness is used
-        np.random.seed(0)
 
         qos_fast = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST, depth=200,
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,   # keep BEST_EFFORT
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE
         )
         qos_rel = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST, depth=50,
-            reliability=QoSReliabilityPolicy.RELIABLE,      # GT stays RELIABLE
+            reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.VOLATILE
         )
 
         self.create_subscription(Imu, self.topic_imu, self.cb_imu, qos_fast)
         self.create_subscription(Odometry, self.topic_gt, self.cb_gt, qos_rel)
 
-        self.pub_out = self.create_publisher(Odometry, self.topic_out, 10)
-        self.pub_pose2d = self.create_publisher(Pose2D, self.topic_pose2d, 10)
+        self.pub_out   = self.create_publisher(Odometry, self.topic_out, 10)
+        self.pub_pose2d= self.create_publisher(Pose2D, self.topic_pose2d, 10)
         self.create_timer(max(0.05, 1.0/self.cli_hz), self.on_cli_timer)
 
         self.get_logger().info(
-            f"[IMU-Localizer] imu={self.topic_imu} | out={self.topic_out}\n"
-            f"                bias_window={self.bias_window_s}s (min_samples={self.bias_min_samples}) | publish=IMU rate"
+            f"[IMU-PRED] imu={self.topic_imu} | out={self.topic_out}\n"
+            f"           bias_window={self.bias_window_s}s (min_samples={self.bias_min_samples}) | publish=IMU rate"
         )
+
+    # ---------- Utils ----------
+    def _normalize_quat(self, q):
+        n = math.sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w)
+        if not math.isfinite(n) or n < 1e-9: return None
+        if abs(n - 1.0) > 1e-6:
+            inv = 1.0/n
+            return (q.x*inv, q.y*inv, q.z*inv, q.w*inv)
+        return (q.x, q.y, q.z, q.w)
+
+    def _nearest_gt(self, t):
+        if not self.gt_t: return None, None, None, None
+        idx = bisect.bisect_left(self.gt_t, t)
+        if idx<=0: i=0
+        elif idx>=len(self.gt_t): i=-1
+        else:
+            i = idx if abs(self.gt_t[idx]-t) < abs(self.gt_t[idx-1]-t) else idx-1
+        return self.gt_x[i], self.gt_y[i], self.gt_v[i], self.gt_yaw[i]
+
+    # ---------- Yaw-scale (deterministic) ----------
+    def _maybe_update_k_yaw(self, t, v_prev, gz_avg, ax_avg, ay_avg):
+        if (not self.yawscale_enable) or (v_prev <= self.yawscale_v_min) or (abs(gz_avg) <= self.yawscale_gz_min):
+            return
+        # basis from current velocity
+        th_v = math.atan2(self.x[4], self.x[3])
+        vx_h, vy_h = math.cos(th_v), math.sin(th_v)
+        nx, ny = -vy_h, vx_h
+        a_par  = ax_avg*vx_h + ay_avg*vy_h
+        a_perp = ax_avg*nx   + ay_avg*ny
+        if (abs(a_perp) > self.yawscale_aperp_min) and (abs(a_par) <= self.yawscale_par_over_perp_max * abs(a_perp)):
+            k_obs = abs(a_perp) / (max(v_prev,1e-3) * max(abs(gz_avg),1e-6))
+            if math.isfinite(k_obs):
+                k_obs = max(self.yawscale_k_min, min(self.yawscale_k_max, k_obs))
+                self._k_obs_buf.append((t, k_obs))
+        # window prune
+        while self._k_obs_buf and (t - self._k_obs_buf[0][0] > self.k_window_s):
+            self._k_obs_buf.popleft()
+        # periodic median update + step clamp
+        if self._last_k_update_t is None:
+            self._last_k_update_t = t
+        if (t - self._last_k_update_t) >= self.k_update_period and self._k_obs_buf:
+            ks = sorted([v for (_, v) in self._k_obs_buf])
+            k_med = ks[len(ks)//2]
+            k_target = (1.0 - self.yawscale_alpha)*self.k_yaw + self.yawscale_alpha*k_med
+            dk = max(-self.k_step_max, min(self.k_step_max, k_target - self.k_yaw))
+            self.k_yaw = max(self.yawscale_k_min, min(self.yawscale_k_max, self.k_yaw + dk))
+            self._last_k_update_t = t
 
     # ---------- Callbacks ----------
     def cb_gt(self, msg: Odometry):
@@ -186,209 +216,130 @@ class ImuWheelEKF(Node):
         self.gt_t.append(t); self.gt_x.append(x); self.gt_y.append(y)
         self.gt_v.append(math.hypot(vx,vy)); self.gt_yaw.append(yaw)
 
-    def _normalize_quat(self, q):
-        n = math.sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w)
-        if not math.isfinite(n) or n < 1e-9:
-            return None
-        if abs(n - 1.0) > 1e-6:
-            inv = 1.0/n
-            return (q.x*inv, q.y*inv, q.z*inv, q.w*inv)
-        return (q.x, q.y, q.z, q.w)
-
-    def _maybe_update_k_yaw(self, t, v_prev, gz_avg, ax_avg, ay_avg):
-        """Collect robust k_obs candidates and update k_yaw at a slower, deterministic cadence."""
-        if (not self.yawscale_enable) or (v_prev <= self.yawscale_v_min) or (abs(gz_avg) <= self.yawscale_gz_min):
-            return
-
-        # unit vectors along velocity and its left-normal (from current vx,vy)
-        vx_prev, vy_prev = self.x[3], self.x[4]
-        if abs(v_prev) < 1e-6:
-            return
-        th_v = math.atan2(vy_prev, vx_prev)
-        vx_h, vy_h = math.cos(th_v), math.sin(th_v)
-        nx, ny = -vy_h, vx_h
-
-        a_par  = ax_avg*vx_h + ay_avg*vy_h
-        a_perp = ax_avg*nx   + ay_avg*ny
-
-        if (abs(a_perp) > self.yawscale_aperp_min) and (abs(a_par) <= self.yawscale_par_over_perp_max * abs(a_perp)):
-            k_obs = abs(a_perp) / (max(v_prev,1e-3) * max(abs(gz_avg),1e-6))
-            if math.isfinite(k_obs):
-                k_obs = max(self.yawscale_k_min, min(self.yawscale_k_max, k_obs))
-                self._k_obs_buf.append((t, k_obs))
-
-        # prune window
-        while self._k_obs_buf and (t - self._k_obs_buf[0][0] > self.k_window_s):
-            self._k_obs_buf.popleft()
-
-        # periodic median update
-        if self._last_k_update_t is None:
-            self._last_k_update_t = t
-        if (t - self._last_k_update_t) >= self.k_update_period and self._k_obs_buf:
-            ks = sorted([v for (_, v) in self._k_obs_buf])
-            k_med = ks[len(ks)//2]
-            # EMA towards median
-            k_target = (1.0 - self.yawscale_alpha)*self.k_yaw + self.yawscale_alpha*k_med
-            # step clamp
-            dk = max(-self.k_step_max, min(self.k_step_max, k_target - self.k_yaw))
-            self.k_yaw = max(self.yawscale_k_min, min(self.yawscale_k_max, self.k_yaw + dk))
-            self._last_k_update_t = t
-
     def cb_imu(self, msg: Imu):
         t = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
-        if self.bias_t0 is None:
-            self.bias_t0 = t
+        if self.bias_t0 is None: self.bias_t0 = t
 
         ax,ay,az = msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z
         gx,gy,gz = msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z
         q = msg.orientation
 
-        # Guard invalid numbers
         if not is_finite(ax,ay,az,gx,gy,gz,q.x,q.y,q.z,q.w):
-            # publish previous state but don't integrate
-            self._publish_output(t)
-            return
+            self._publish_output(t); return
 
         qn = self._normalize_quat(q)
-        if qn is None:
-            # can't use attitude; publish but skip integration
-            self._publish_output(t)
-            return
+        if qn is None: self._publish_output(t); return
         qx,qy,qz,qw = qn
-
-        Rwb = rot3_from_quat(qx,qy,qz,qw)  # world_from_body
+        Rwb = rot3_from_quat(qx,qy,qz,qw)
+        Rbw = Rwb.T
         yaw_q = yaw_from_quat(qx,qy,qz,qw)
 
-        # Bias lock window (deterministic: require both time & min samples)
-        if not self.bias_locked:
-            a = np.array([ax,ay,az], float); w = np.array([gx,gy,gz], float)
-            if (abs(gz) < 0.05) and (np.linalg.norm(w) < 0.2) and (abs(np.linalg.norm(a)-G) < 0.5):
-                self._acc_buf.append(a); self._gz_buf.append(gz); self._bias_samp_count += 1
+        g_world = np.array([0.0, 0.0, self.gravity_sign * G], float)
 
-            # lock only when both satisfied
-            if ((t - self.bias_t0) >= self.bias_window_s) and (self._bias_samp_count >= self.bias_min_samples):
-                if self._acc_buf: self.acc_b = np.mean(np.array(self._acc_buf), axis=0)
-                if self._gz_buf:  self.gz_b  = float(np.mean(self._gz_buf))
+        # -------- Bias lock (time + min samples + stillness), TRUE accel bias --------
+        if not self.bias_locked:
+            a_raw = np.array([ax,ay,az], float)
+            # remove world gravity rotated into body for each sample -> specific force + bias
+            g_body = Rbw @ g_world
+            self._acc_bias_sum += (a_raw - g_body)
+            self._gz_sum += gz
+            self._bias_samp_count += 1
+
+            # stillness gates ensure we’re truly stationary while collecting
+            w_norm = math.sqrt(gx*gx + gy*gy + gz*gz)
+            if ((t - self.bias_t0) >= self.bias_window_s) and (self._bias_samp_count >= self.bias_min_samples) \
+               and (abs(gz) < 0.05) and (w_norm < 0.2) and (abs(np.linalg.norm(a_raw) - G) < 0.6):
+                self.acc_b = self._acc_bias_sum / max(1, self._bias_samp_count)  # true sensor bias (body)
+                self.gz_b  = self._gz_sum / max(1, self._bias_samp_count)
                 self.bias_locked = True
                 self.get_logger().info(
-                    f"[IMU-Localizer] Bias locked with {self._bias_samp_count} samples: "
-                    f"acc_b={self.acc_b.round(4).tolist()} m/s², gyro_bz={self.gz_b:.5f} rad/s"
+                    f"[IMU-PRED] Bias locked ({self._bias_samp_count} samples): "
+                    f"acc_bias_b={self.acc_b.round(4).tolist()} m/s², gyro_bz={self.gz_b:.5f} rad/s"
                 )
                 self.x[2] = yaw_q
-                if self.init_sigma_v > 0.0:
-                    self.x[3] = np.random.normal(0.0, self.init_sigma_v)
-                    self.x[4] = np.random.normal(0.0, self.init_sigma_v)
                 self.last_imu_t = t
                 self._last_imu_proc_t = t
-                # Initialize trapezoid prevs from first valid sample
-                self._prev_axw = 0.0; self._prev_ayw = 0.0; self._prev_gz = 0.0
+                # first post-lock: init trapezoid prevs from first real sample (not zeros)
+                self._prev_axw = None; self._prev_ayw = None; self._prev_gz = None
                 self._publish_output(t)
                 return
             else:
-                # still pre-lock: publish current pose (no motion)
                 self._publish_output(t)
                 return
 
-        # Optional IMU downsample (deterministic on timestamps)
+        # Optional timestamp gating
         if self.imu_use_rate_hz > 0.0 and self._last_imu_proc_t is not None:
             if (t - self._last_imu_proc_t) < (1.0 / self.imu_use_rate_hz):
-                self._publish_output(t)  # publish anyway at IMU rate
-                return
+                self._publish_output(t); return
 
-        # Compute dt and sub-steps (never skip)
+        # dt & sub-steps
         t_prev = self.last_imu_t if self.last_imu_t is not None else t
         dt_raw = t - t_prev
-        if dt_raw < 0.0:
-            dt_raw = 0.0  # clamp negatives
+        if dt_raw < 0.0: dt_raw = 0.0
         n_steps = max(1, int(math.ceil(dt_raw / DT_MAX)))
         dt_step = (dt_raw / n_steps) if n_steps > 0 else 0.0
-
         self.last_imu_t = t
         self._last_imu_proc_t = t
 
-        # Bias-correct IMU
+        # Body specific force (remove true bias), then world specific force (remove g_world)
         a_body = np.array([ax,ay,az], float) - self.acc_b
+        a_world3 = Rwb @ a_body - g_world
+        ax_w, ay_w = float(a_world3[0]), float(a_world3[1])
         gz_c = gz - self.gz_b
 
-        # Gravity compensation in WORLD
-        a_world3 = Rwb @ a_body - np.array([0.0,0.0,G])
-        ax_w, ay_w = float(a_world3[0]), float(a_world3[1])
-
-        # Trapezoidal inputs vs previous sample
-        if self._prev_axw is None:  # first post-lock sample
+        # Trapezoidal inputs (init from first real post-lock sample)
+        if self._prev_axw is None:
             self._prev_axw, self._prev_ayw, self._prev_gz = ax_w, ay_w, gz_c
 
         ax_avg = 0.5 * (self._prev_axw + ax_w)
         ay_avg = 0.5 * (self._prev_ayw + ay_w)
         gz_avg = 0.5 * (self._prev_gz  + gz_c)
 
-        # Yaw-scale robust update (at slow cadence, median window, rate-limited)
+        # Deterministic yaw-scale update
         v_prev = math.hypot(self.x[3], self.x[4])
         self._maybe_update_k_yaw(t, v_prev, gz_avg, ax_avg, ay_avg)
+        gz_used = (self.k_yaw * gz_avg) if self.yawscale_enable else gz_avg
 
-        # Integrate piecewise (using averaged inputs per this interval)
-        gz_used = self.k_yaw * gz_avg
         leak = (lambda dt: math.exp(-self.vel_leak_hz * dt) if self.vel_leak_hz > 0.0 else 1.0)
 
+        # Integrate with sub-steps (using the averaged inputs for this interval)
         for _ in range(n_steps):
             dt = dt_step
-            if dt <= 0.0:
-                continue
+            if dt <= 0.0: continue
             # yaw
             self.x[2] = wrap(self.x[2] + gz_used * dt)
-            # vel (world)
+            # velocity (world)
             vx_prev, vy_prev = self.x[3], self.x[4]
             lk = leak(dt)
             self.x[3] = lk * (vx_prev + ax_avg * dt)
             self.x[4] = lk * (vy_prev + ay_avg * dt)
-            # pos
+            # position
             self.x[0] += self.x[3] * dt
             self.x[1] += self.x[4] * dt
 
-            # Process cov (minimal; defaults may be zeros)
-            A = np.array([[1,0,0,dt,0],
-                          [0,1,0,0,dt],
-                          [0,0,1,0,0],
-                          [0,0,0,1,0],
-                          [0,0,0,0,1]], float)
-            sig_a = self.sigma_acc; sig_y = self.sigma_yaw
-            Qd = np.diag([(0.5*dt*dt*sig_a)**2,
-                          (0.5*dt*dt*sig_a)**2,
-                          (sig_y*math.sqrt(dt))**2,
-                          (dt*sig_a)**2,
-                          (dt*sig_a)**2])
-            self.P = A @ self.P @ A.T + Qd
-
-        # Save helpers for next trapezoid / logs
+        # Save for next interval
         self._prev_axw, self._prev_ayw, self._prev_gz = ax_w, ay_w, gz_c
         self.last_axw = math.hypot(ax_w, ay_w)
         self.last_yawrate = gz_used
 
-        # Log prediction-only
+        # Log + publish
         v_pred = float(math.hypot(self.x[3], self.x[4]))
         self.pred_log.append((t, self.x[0], self.x[1], self.x[2], v_pred))
-
-        # Publish at IMU rate
         self._publish_output(t)
 
-    # ---------- CLI + helpers ----------
+    # ---------- CLI ----------
     def on_cli_timer(self):
-        if not self.bias_locked:
-            return
+        if not self.bias_locked: return
         now = time.time()
-        if now - self.last_cli < (1.0 / max(1e-3, self.cli_hz)):
-            return
+        if now - self.last_cli < (1.0 / max(1e-3, self.cli_hz)): return
         self.last_cli = now
         t = self.last_imu_t
-        if t is None:
-            return
+        if t is None: return
 
         x_p, y_p, yaw_p = self.x[0], self.x[1], self.x[2]
         v_p = float(math.hypot(self.x[3], self.x[4]))
-        if self.last_output is None:
-            x_c,y_c,yaw_c,v_c = x_p,y_p,yaw_p,v_p
-        else:
-            _, x_c,y_c,yaw_c,v_c = self.last_output
+        if self.last_output is None: x_c,y_c,yaw_c,v_c = x_p,y_p,yaw_p,v_p
+        else: _, x_c,y_c,yaw_c,v_c = self.last_output
 
         xg, yg, vg, ygaw = self._nearest_gt(t)
         epos_p = float('nan') if xg is None else math.hypot(x_p-xg, y_p-yg)
@@ -403,16 +354,7 @@ class ImuWheelEKF(Node):
             f"err_pos pred/corr={epos_p:.2f}/{epos_c:.2f} m  err_yaw corr={eyaw_c:.1f}°  dv corr={ev_c:.2f}"
         )
 
-    def _nearest_gt(self, t):
-        if not self.gt_t:
-            return None, None, None, None
-        idx = bisect.bisect_left(self.gt_t, t)
-        if idx<=0: i=0
-        elif idx>=len(self.gt_t): i=-1
-        else:
-            i = idx if abs(self.gt_t[idx]-t) < abs(self.gt_t[idx-1]-t) else idx-1
-        return self.gt_x[i], self.gt_y[i], self.gt_v[i], self.gt_yaw[i]
-
+    # ---------- Publish ----------
     def _publish_output(self, t: float):
         from geometry_msgs.msg import Pose, PoseWithCovariance, Twist, TwistWithCovariance, Point, Quaternion, Vector3
         x,y,yaw = self.x[0], self.x[1], self.x[2]
@@ -434,16 +376,16 @@ class ImuWheelEKF(Node):
         )
         self.pub_out.publish(od)
 
-        p2 = Pose2D()
-        p2.x = x; p2.y = y; p2.theta = yaw
+        p2 = Pose2D(); p2.x = x; p2.y = y; p2.theta = yaw
         self.pub_pose2d.publish(p2)
+
 
 # ---------- main ----------
 def main():
     rclpy.init()
     node = ImuWheelEKF()
     try:
-        rclpy.spin(node)  # run indefinitely until externally stopped
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
