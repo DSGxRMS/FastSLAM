@@ -75,6 +75,9 @@ class ImuWheelEKF(Node):  # keep class name for your entry-point
         self.declare_parameter("yawscale.window_s", 0.75)         # median window
         self.declare_parameter("yawscale.step_max", 0.05)         # |Δk| clamp
 
+        # NEW: publish yaw deadband (publish-only)
+        self.declare_parameter("pub.yaw_deadband", 0.01)       # rad
+
         P = lambda k: self.get_parameter(k).value
         self.topic_imu   = str(P("topics.imu"))
         self.topic_gt    = str(P("topics.gt_odom"))
@@ -99,6 +102,7 @@ class ImuWheelEKF(Node):  # keep class name for your entry-point
         self.k_update_period   = float(P("yawscale.update_period_s"))
         self.k_window_s        = float(P("yawscale.window_s"))
         self.k_step_max        = float(P("yawscale.step_max"))
+        self.yaw_deadband      = float(P("pub.yaw_deadband"))
 
         # --- State x=[x, y, yaw, vx, vy] ---
         self.x = np.zeros(5, float)
@@ -109,8 +113,14 @@ class ImuWheelEKF(Node):  # keep class name for your entry-point
         self.acc_b = np.zeros(3)     # true accel bias (body)
         self.gz_b  = 0.0
         self._bias_samp_count = 0
-        self._acc_bias_sum = np.zeros(3)  # accumulates (raw - Rbw*g_world)
+        self._acc_bias_sum = np.zeros(3)  # (kept, but not used for locking now)
         self._gz_sum = 0.0
+
+        # Robust bias buffers
+        self._acc_all = []    # list of (a_raw - Rbw*g_world)
+        self._gz_all  = []
+        self._acc_still = []
+        self._gz_still  = []
 
         self.last_imu_t = None
         self._last_imu_proc_t = None
@@ -177,11 +187,28 @@ class ImuWheelEKF(Node):  # keep class name for your entry-point
             i = idx if abs(self.gt_t[idx]-t) < abs(self.gt_t[idx-1]-t) else idx-1
         return self.gt_x[i], self.gt_y[i], self.gt_v[i], self.gt_yaw[i]
 
+    def _trimmed_mean_vec(self, arr, trim=0.1):
+        if not arr: return None
+        A = np.asarray(arr, float)
+        n = A.shape[0]
+        if n == 1: return A[0]
+        k = int(max(0, min(n//2, round(trim*n))))
+        if k > 0: A = np.sort(A, axis=0)[k:n-k]
+        return np.mean(A, axis=0)
+
+    def _trimmed_mean_scalar(self, arr, trim=0.1):
+        if not arr: return None
+        a = np.asarray(arr, float)
+        n = a.size
+        if n == 1: return float(a[0])
+        k = int(max(0, min(n//2, round(trim*n))))
+        if k > 0: a = np.sort(a)[k:n-k]
+        return float(np.mean(a))
+
     # ---------- Yaw-scale (deterministic) ----------
     def _maybe_update_k_yaw(self, t, v_prev, gz_avg, ax_avg, ay_avg):
         if (not self.yawscale_enable) or (v_prev <= self.yawscale_v_min) or (abs(gz_avg) <= self.yawscale_gz_min):
             return
-        # basis from current velocity
         th_v = math.atan2(self.x[4], self.x[3])
         vx_h, vy_h = math.cos(th_v), math.sin(th_v)
         nx, ny = -vy_h, vx_h
@@ -192,17 +219,15 @@ class ImuWheelEKF(Node):  # keep class name for your entry-point
             if math.isfinite(k_obs):
                 k_obs = max(self.yawscale_k_min, min(self.yawscale_k_max, k_obs))
                 self._k_obs_buf.append((t, k_obs))
-        # window prune
         while self._k_obs_buf and (t - self._k_obs_buf[0][0] > self.k_window_s):
             self._k_obs_buf.popleft()
-        # periodic median update + step clamp
         if self._last_k_update_t is None:
             self._last_k_update_t = t
         if (t - self._last_k_update_t) >= self.k_update_period and self._k_obs_buf:
             ks = sorted([v for (_, v) in self._k_obs_buf])
             k_med = ks[len(ks)//2]
             k_target = (1.0 - self.yawscale_alpha)*self.k_yaw + self.yawscale_alpha*k_med
-            dk = max(-self.k_step_max, min(self.k_step_max, k_target - self.k_yaw))
+            dk = max(-self.yawscale_step_max, min(self.yawscale_step_max, k_target - self.k_yaw)) if hasattr(self,'yawscale_step_max') else max(-self.k_step_max, min(self.k_step_max, k_target - self.k_yaw))
             self.k_yaw = max(self.yawscale_k_min, min(self.yawscale_k_max, self.k_yaw + dk))
             self._last_k_update_t = t
 
@@ -236,34 +261,50 @@ class ImuWheelEKF(Node):  # keep class name for your entry-point
 
         g_world = np.array([0.0, 0.0, self.gravity_sign * G], float)
 
-        # -------- Bias lock (time + min samples + stillness), TRUE accel bias --------
+        # -------- Bias lock (time + min samples) with robust fallback --------
         if not self.bias_locked:
             a_raw = np.array([ax,ay,az], float)
-            # remove world gravity rotated into body for each sample -> specific force + bias
             g_body = Rbw @ g_world
-            self._acc_bias_sum += (a_raw - g_body)
-            self._gz_sum += gz
+            spec_plus_bias = (a_raw - g_body)  # specific force + true sensor bias (in body)
+            self._acc_all.append(spec_plus_bias.tolist())
+            self._gz_all.append(gz)
             self._bias_samp_count += 1
 
-            # stillness gates ensure we’re truly stationary while collecting
+            # prefer “still” samples for bias
             w_norm = math.sqrt(gx*gx + gy*gy + gz*gz)
-            if ((t - self.bias_t0) >= self.bias_window_s) and (self._bias_samp_count >= self.bias_min_samples) \
-               and (abs(gz) < 0.05) and (w_norm < 0.2) and (abs(np.linalg.norm(a_raw) - G) < 0.6):
-                self.acc_b = self._acc_bias_sum / max(1, self._bias_samp_count)  # true sensor bias (body)
-                self.gz_b  = self._gz_sum / max(1, self._bias_samp_count)
+            if (abs(gz) < 0.05) and (w_norm < 0.2) and (abs(np.linalg.norm(a_raw) - G) < 0.6):
+                self._acc_still.append(spec_plus_bias.tolist())
+                self._gz_still.append(gz)
+
+            # lock condition: deterministic window + min samples
+            if ((t - self.bias_t0) >= self.bias_window_s) and (self._bias_samp_count >= self.bias_min_samples):
+                use_still = (len(self._acc_still) >= self.bias_min_samples // 2)
+                if use_still:
+                    self.acc_b = np.mean(np.asarray(self._acc_still, float), axis=0)
+                    self.gz_b  = float(np.mean(np.asarray(self._gz_still,  float)))
+                    src = "STILL"
+                else:
+                    # trimmed-mean fallback for robustness while moving
+                    acc_tm = self._trimmed_mean_vec(self._acc_all, trim=0.10)
+                    gz_tm  = self._trimmed_mean_scalar(self._gz_all, trim=0.10)
+                    self.acc_b = acc_tm if acc_tm is not None else np.zeros(3)
+                    self.gz_b  = gz_tm if gz_tm is not None else 0.0
+                    src = "FALLBACK"
                 self.bias_locked = True
                 self.get_logger().info(
-                    f"[IMU-PRED] Bias locked ({self._bias_samp_count} samples): "
+                    f"[IMU-PRED] Bias locked [{src}] (N_total={self._bias_samp_count}, N_still={len(self._acc_still)}): "
                     f"acc_bias_b={self.acc_b.round(4).tolist()} m/s², gyro_bz={self.gz_b:.5f} rad/s"
                 )
+                # initialize state timing & integrator prevs
                 self.x[2] = yaw_q
                 self.last_imu_t = t
                 self._last_imu_proc_t = t
-                # first post-lock: init trapezoid prevs from first real sample (not zeros)
                 self._prev_axw = None; self._prev_ayw = None; self._prev_gz = None
                 self._publish_output(t)
                 return
             else:
+                # publish yaw only (zero velocity) until lock
+                self.x[2] = yaw_q
                 self._publish_output(t)
                 return
 
@@ -359,8 +400,13 @@ class ImuWheelEKF(Node):  # keep class name for your entry-point
         from geometry_msgs.msg import Pose, PoseWithCovariance, Twist, TwistWithCovariance, Point, Quaternion, Vector3
         x,y,yaw = self.x[0], self.x[1], self.x[2]
         v = float(math.hypot(self.x[3], self.x[4]))
-        self.corr_log.append((t, x, y, yaw, v))
-        self.last_output = (t, x, y, yaw, v)
+
+        # --- publish-only yaw deadband ---
+        yaw_wrapped = wrap(yaw)
+        yaw_pub = 0.0 if abs(yaw_wrapped) < self.yaw_deadband else yaw_wrapped
+
+        self.corr_log.append((t, x, y, yaw_pub, v))
+        self.last_output = (t, x, y, yaw_pub, v)
 
         od = Odometry()
         od.header.stamp = rclpy.time.Time(seconds=t).to_msg()
@@ -369,14 +415,14 @@ class ImuWheelEKF(Node):  # keep class name for your entry-point
         od.pose = PoseWithCovariance()
         od.twist = TwistWithCovariance()
         od.pose.pose = Pose(position=Point(x=x, y=y, z=0.0), orientation=Quaternion())
-        od.pose.pose.orientation = quat_from_yaw(yaw)
+        od.pose.pose.orientation = quat_from_yaw(yaw_pub)
         od.twist.twist = Twist(
-            linear=Vector3(x=v*math.cos(yaw), y=v*math.sin(yaw), z=0.0),
-            angular=Vector3(x=0.0, y=0.0, z=self.last_yawrate)
+            linear=Vector3(x=v*math.cos(yaw_pub), y=v*math.sin(yaw_pub), z=0.0),
+            angular=Vector3(x=0.0, y=0.0, z=self.last_yawrate)  # yawrate unchanged
         )
         self.pub_out.publish(od)
 
-        p2 = Pose2D(); p2.x = x; p2.y = y; p2.theta = yaw
+        p2 = Pose2D(); p2.x = x; p2.y = y; p2.theta = yaw_pub
         self.pub_pose2d.publish(p2)
 
 
